@@ -7,6 +7,7 @@
   const controllers = new Set();
   let apiBase = '', accessToken = '', connected = false, revision = 0, message = '';
   let publicMode = false, visitorSession = false, sharedAvailable = false, sessionMode = '', expiresAt = '', publicLimits = {};
+  let features = [], searchLimits = {};
   let catalogPromise;
   const freeEngineIds = ['baidu', 'bing', 'google', 'yandex', 'duckduckgo'];
   const engineDefaults = [
@@ -87,7 +88,7 @@
     return url.href.replace(/\/+$/, '');
   }
 
-  function snapshot() { return Object.freeze({ mode, apiBase, connected, hasToken: Boolean(accessToken), revision, message, publicMode, visitorSession, sharedAvailable, sessionMode, expiresAt, publicLimits: { ...publicLimits } }); }
+  function snapshot() { return Object.freeze({ mode, apiBase, connected, hasToken: Boolean(accessToken), revision, message, publicMode, visitorSession, sharedAvailable, sessionMode, expiresAt, publicLimits: { ...publicLimits }, features: [...features], searchLimits: { ...searchLimits } }); }
   function emit(reason) { listeners.forEach(listener => listener(snapshot(), reason)); }
   function forgetStored() { try { sessionStorage.removeItem(storageKey); } catch (_) { /* Storage may be disabled. */ } }
   function remember() {
@@ -145,9 +146,9 @@
     if (!connected) {
       if ((options.method || 'GET') === 'GET') {
         if (path === '/api/platforms') return catalog();
-        if (path === '/api/config') return { base_url: '', model: '', searxng_url: '', custom_sites: [], search_engines: [], has_api_key: false, has_tavily_key: false, has_brave_key: false, shared_available: false, offline: true };
+        if (path === '/api/config') return { base_url: '', model: '', searxng_url: '', custom_sites: [], search_engines: [], search_concurrency: 4, has_api_key: false, has_tavily_key: false, has_brave_key: false, shared_available: false, offline: true };
         if (path === '/api/search-engines') return fallbackEngines();
-        if (path === '/api/history' || path === '/api/library') return { items: [], offline: true };
+        if (path === '/api/history' || path === '/api/library' || path === '/api/jobs') return { items: [], offline: true };
       }
       throw failure('请先连接搜索服务，再使用智能搜索、历史记录或资料库。', 'BACKEND_REQUIRED');
     }
@@ -196,6 +197,8 @@
     sessionMode = '';
     expiresAt = '';
     publicLimits = {};
+    features = [];
+    searchLimits = {};
     message = '正在验证搜索服务…';
     forgetStored();
     invalidate('changing');
@@ -206,6 +209,8 @@
       publicMode = health.public_mode === true;
       sharedAvailable = health.shared_available === true;
       publicLimits = health.public_limits && typeof health.public_limits === 'object' ? { ...health.public_limits } : {};
+      features = Array.isArray(health.features) ? health.features.filter(value => typeof value === 'string') : health.features && typeof health.features === 'object' ? Object.keys(health.features).filter(key => health.features[key] === true) : [];
+      searchLimits = health.search_limits && typeof health.search_limits === 'object' ? { ...health.search_limits } : {};
       let replaced = false;
       if (publicMode && !current.token) await createSession(current, options.mode);
       let platforms;
@@ -239,6 +244,8 @@
     sessionMode = '';
     expiresAt = '';
     publicLimits = {};
+    features = [];
+    searchLimits = {};
     message = '未连接搜索服务';
     forgetStored();
     invalidate('disconnected');

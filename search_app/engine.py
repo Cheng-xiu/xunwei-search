@@ -1,7 +1,7 @@
 """Bounded real retrieval followed by source-grounded AI evaluation."""
 from __future__ import annotations
 
-import concurrent.futures
+import copy
 import hashlib
 import json
 import re
@@ -15,7 +15,8 @@ from .providers import (search_provider, available_providers, canonical_url, nat
 from .safety import check_query
 from .summarizer import summarize_results
 from .progress_report import build_progress_report
-from .retrieval import DIRECT_PROVIDERS, depth_profile, anchor_coverage, is_excluded
+from .retrieval import (DIRECT_PROVIDERS, depth_profile, anchor_coverage, is_excluded,
+                        effective_search_concurrency, parallel_calls, interruptible_call, request_slot)
 
 DOMAINS = {key: domains[0] for key, domains in PLATFORM_HOSTS.items()}
 DATING_CONDITIONS = (
@@ -295,6 +296,7 @@ def run_search(job, config, storage, update):
     def checked_update(**fields):
         if cancel.is_set():
             raise SearchStopped()
+        fields = copy.deepcopy(fields)
         latest.update(fields)
         update(**fields)
 
@@ -303,26 +305,58 @@ def run_search(job, config, storage, update):
             raise SearchStopped()
         return _run_single_search(job, {**config, '_cancel_event': cancel}, storage, checked_update)
     except SearchStopped:
+        rounds = copy.deepcopy(latest.get('rounds', []))
+        for record in rounds:
+            if record.get('state') == 'running':
+                record['state'] = 'stopped'
+                for task in record.get('queries', []):
+                    if task.get('status') in ('queued', 'running'):
+                        task['status'] = 'cancelled'
+            if (record.get('report') or {}).get('state') == 'running':
+                record['report'].update(state='stopped', message='本轮报告已停止，已有线索已保留。')
+        report = copy.deepcopy(latest.get('progress_report'))
+        if report and report.get('state') == 'running':
+            report.update(state='stopped', message='本轮报告已停止，已有线索已保留。')
+        summary = copy.deepcopy(latest.get('ai_summary'))
+        if summary and summary.get('state') == 'running':
+            summary = copy.deepcopy(job.get('ai_summary')) or {**summary, 'state': 'stopped', 'message': '本轮总结已停止。'}
+        if summary is None:
+            summary = {'state': 'disabled', 'points': [], 'limitations': [], 'source_count': 0, 'considered_count': 0, 'message': '搜索已停止，尚未生成总结。'}
         update(state='stopped', stage='stopped', progress=100, stop_reason='user',
-               message='已停止搜索，已有结果已保留。', results=latest.get('results', []))
+               message='已停止搜索，已有结果已保留。', results=latest.get('results', []),
+               rounds=rounds, progress_report=report, ai_summary=summary)
 
 
 def _run_single_search(job, config, storage, update):
     query, platforms = job['query'], job['platforms']
+    stop_event = config['_cancel_event']
+    concurrency = effective_search_concurrency(job, config)
+    def check_stopped():
+        if stop_event.is_set():
+            raise SearchStopped()
     public_post_only = bool(job.get('public_post_only') or check_query(query).get('public_post_only'))
     warnings = list(job.get('warnings', []))
     def warn(message):
         if message not in warnings:
             warnings.append(message)
         update(warnings=list(warnings))
-    update(state='running', stage='planning', progress=6, message='拆解问题，保留稀有词和精确条件。')
-    plan = make_plan(query, config, job['use_ai'], warn, public_post_only)
+    update(state='running', stage='planning', progress=6, search_concurrency=concurrency, message='拆解问题，保留稀有词和精确条件。')
+    plan_warnings = []
+    outcome, plan = interruptible_call(lambda: make_plan(query, config, job['use_ai'], plan_warnings.append, public_post_only), stop_event)
+    check_stopped()
+    if outcome != 'ok' or not isinstance(plan, dict):
+        plan = fallback_plan(query)
+        plan['must_have'] = required_conditions(query, public_post_only=public_post_only)
+        plan_warnings.append('AI 规划暂不可用，使用原始问题。')
+    for message in plan_warnings:
+        warn(message)
     sites = job.get('custom_sites', [])
     update(plan=plan, stage='searching', progress=18, message='并行检索公开索引、平台入口和本地资料。',
            native_links=native_search_links(query, platforms) + custom_search_links(query, sites))
     gathered, statuses = [], []
     seen_local = set()
     for variant in [q['query'] for q in plan['queries'][:4]]:
+        check_stopped()
         for item in storage.search_documents(variant, limit=40):
             host = urlsplit(item.get('url', '')).hostname or ''
             in_sites = any(host == site['domain'] or host.endswith('.' + site['domain']) for site in sites)
@@ -331,37 +365,63 @@ def _run_single_search(job, config, storage, update):
                 gathered.append(item)
     statuses.append({'provider': 'local', 'ok': True, 'count': len(gathered)})
     tasks = build_tasks(plan, platforms, job['depth'], config, sites)
+    rounds = copy.deepcopy(job.get('rounds', []))
+    round_number = max(int(job.get('round', 0)), max((int(record.get('number', 0)) for record in rounds), default=0)) + 1
+    record = {'number': round_number, 'state': 'running', 'new_results': 0, 'updated_results': 0,
+              'total_results': 0, 'reason': '普通单轮检索，按原始条件评估当前证据。', 'queries': [], 'platform_stats': []}
+    rounds.append(record)
+    task_items = []
+    for provider, text, scope in tasks:
+        target, resume_query = scope[0], text
+        if target in DOMAINS and provider not in DIRECT_PROVIDERS:
+            suffix = ' site:' + DOMAINS[target]
+            if resume_query.endswith(suffix):
+                resume_query = resume_query[:-len(suffix)]
+        task_record = {'provider': provider, 'query': resume_query, 'platform': target, 'status': 'queued'}
+        record['queries'].append(task_record)
+        task_items.append((task_record, provider, text, scope))
+    base_searches_count = int(job.get('searches_count', 0))
+    update(round=round_number, rounds=rounds, searches_count=base_searches_count)
     retrieval_config = {**config, '_search_depth': job['depth']}
     if re.search(r'\bissue\b|\bbug\b|\berror\b|故障|报错|不触发', query, re.I):
         retrieval_config['_github_search_kind'] = 'issues'
     provider_limit = {'quick': 10, 'deep': 30, 'research': 50}.get(job['depth'], 10)
-    def retrieve(provider, text, scope):
-        if config['_cancel_event'].is_set():
-            return {'results': [], 'status': {'provider': provider, 'ok': False, 'count': 0, 'error': '已停止'}}
-        if scope[0].startswith('website:'):
-            site = next(site for site in sites if site['domain'] == scope[0].split(':', 1)[1])
-            return search_custom_site(site, text, provider_limit, {**retrieval_config, '_engine': provider})
-        return search_provider(provider, text, scope, provider_limit, retrieval_config)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {pool.submit(retrieve, p, q, scope): (p, q) for p, q, scope in tasks}
-        for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
-            p, q = futures[future]
-            try:
-                result = future.result()
+    def retrieve(item):
+        _, provider, text, scope = item
+        with request_slot(retrieval_config, stop_event):
+            if scope[0].startswith('website:'):
+                site = next(site for site in sites if site['domain'] == scope[0].split(':', 1)[1])
+                return search_custom_site(site, text, provider_limit, {**retrieval_config, '_engine': provider})
+            return search_provider(provider, text, scope, provider_limit, retrieval_config)
+    def submitted(item):
+        item[0]['status'] = 'running'
+    completed = 0
+    for (task_record, provider, text, scope), outcome, result in parallel_calls(task_items, retrieve, concurrency, stop_event, submitted):
+        check_stopped()
+        if outcome == 'ok' and isinstance(result, dict):
+            status = dict(result.get('status') or {'provider': provider, 'ok': False, 'count': 0, 'error': '来源未返回状态'})
+            if not status.get('cancelled'):
                 gathered.extend(result.get('results', []))
-                status = result.get('status', {'provider': p, 'ok': False, 'count': 0, 'error': '来源未返回状态'})
-                status['query'] = q
-                statuses.append(status)
-            except Exception:
-                statuses.append({'provider': p, 'ok': False, 'count': 0, 'query': q, 'error': '来源请求失败，请稍后重试。'})
-            partial = {}
-            if not public_post_only:
-                for item in gathered:
-                    row = clean_result(item, query)
-                    if row and has_query_signal(query, row, plan):
-                        partial[row['url'] or 'local:' + row['id']] = row
-            update(provider_status=list(statuses), results=sorted(partial.values(), key=lambda r: r['score'], reverse=True)[:60],
-                   progress=18+round(42*index/max(1, len(tasks))), message=f'已完成 {index}/{len(tasks)} 个检索请求。')
+        else:
+            status = {'provider': provider, 'ok': False, 'count': 0, 'error': '来源请求失败，请稍后重试。'}
+            if outcome == 'cancelled':
+                status['cancelled'] = True
+        task_record['status'] = 'cancelled' if status.get('cancelled') else 'completed'
+        status.update(query=text, platform=scope[0], round=round_number)
+        statuses.append(status)
+        completed += 1
+        partial = {}
+        if not public_post_only:
+            for item in gathered:
+                row = clean_result(item, query)
+                if row and has_query_signal(query, row, plan):
+                    partial[row['url'] or 'local:' + row['id']] = row
+        visible_results = sorted(partial.values(), key=lambda r: r['score'], reverse=True)[:60]
+        record.update(new_results=len(visible_results), total_results=len(visible_results))
+        update(provider_status=list(statuses), results=visible_results, rounds=rounds,
+               searches_count=base_searches_count + completed,
+               progress=18+round(42*completed/max(1, len(tasks))), message=f'已完成 {completed}/{len(tasks)} 个检索请求。')
+    check_stopped()
     unique = {}
     for item in gathered:
         r = clean_result(item, query)
@@ -376,26 +436,37 @@ def _run_single_search(job, config, storage, update):
     results = sorted(unique.values(), key=lambda r: relevance(query, r), reverse=True)[:60]
     # A zero lexical overlap is not a discovery; unrelated upstream suggestions are discarded.
     results = [r for r in results if has_query_signal(query, r, plan)]
+    update(results=results if not public_post_only else [])
     if job['fetch_pages'] and results:
         update(stage='reading', progress=63, message='读取可公开访问的原文；无法访问时保留摘要并标记。')
         targets = [r for r in results if r['content_level'] not in ('local', 'page') and r['url']][:depth_profile(job['depth'])['pages']]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(fetch_public_page, r['url'], 12000, cancel_event=config['_cancel_event']): r for r in targets}
-            for f in concurrent.futures.as_completed(futures):
-                r = futures[f]
-                try:
-                    page = f.result()
-                    if page.get('text') and not page.get('error'):
-                        r['body'] = page['text'][:12000]
-                        r['content_level'] = 'page'
-                    else:
-                        r['fetch_error'] = str(page.get('error', '无可读取原文'))[:240]
-                except Exception:
-                    r['fetch_error'] = '原文读取失败。'
+        def read_source(result):
+            with request_slot(config, stop_event):
+                return fetch_public_page(result['url'], 12000, cancel_event=stop_event)
+        for result, outcome, page in parallel_calls(targets, read_source, concurrency, stop_event):
+            check_stopped()
+            if outcome == 'ok' and isinstance(page, dict):
+                if page.get('text') and not page.get('error'):
+                    result['body'], result['content_level'] = page['text'][:12000], 'page'
+                else:
+                    result['fetch_error'] = str(page.get('error', '无可读取原文'))[:240]
+            else:
+                result['fetch_error'] = '原文读取失败。'
+            if not public_post_only:
+                update(results=results)
+        check_stopped()
     assessed_count = 0
     if results and job['use_ai']:
         update(stage='evaluating', progress=82, message='AI 逐条核对条件和原文引用。')
-        assessed_count = assess(query, results, plan, config, warn, public_post_only)
+        assessed_results, assessment_warnings = copy.deepcopy(results), []
+        outcome, count = interruptible_call(lambda: assess(query, assessed_results, copy.deepcopy(plan), config, assessment_warnings.append, public_post_only), stop_event)
+        check_stopped()
+        if outcome == 'ok':
+            results, assessed_count = assessed_results, count if isinstance(count, int) else 0
+        else:
+            assessment_warnings.append('AI 证据审查暂不可用，保留未核实候选。')
+        for message in assessment_warnings:
+            warn(message)
         if assessed_count and len(results) > assessed_count:
             warn(f'本轮仅对排序靠前的 {assessed_count} 条候选进行 AI 证据审查，其余保留为未核实。')
     results = [r for r in results if not is_excluded(r)]
@@ -429,22 +500,15 @@ def _run_single_search(job, config, storage, update):
     if job['use_ai']:
         update(stage='summarizing', progress=94, message='根据已有结果生成带来源的 AI 总结。',
                results=results, summary=summary, ai_summary={**ai_summary, 'state': 'running', 'message': '正在归纳已有结果与来源…'})
-        try:
-            ai_summary = summarize_results(query, results, config, plan, warnings)
-        except Exception:
+        outcome, value = interruptible_call(lambda: summarize_results(query, copy.deepcopy(results), config, copy.deepcopy(plan), list(warnings)), stop_event)
+        check_stopped()
+        if outcome == 'ok' and isinstance(value, dict):
+            ai_summary = value
+        else:
             ai_summary = {**ai_summary, 'state': 'error', 'message': 'AI 总结暂未完成，搜索结果已保留，可稍后重试。'}
-    completed_queries = []
-    for provider, text, scope in tasks:
-        target = scope[0]
-        if target in DOMAINS and provider not in DIRECT_PROVIDERS:
-            suffix = ' site:' + DOMAINS[target]
-            if text.endswith(suffix):
-                text = text[:-len(suffix)]
-        completed_queries.append({'provider': provider, 'query': text, 'platform': target, 'status': 'completed'})
-    report_record = {'number': 1, 'state': 'completed', 'new_results': len(results), 'updated_results': 0,
-                     'total_results': len(results), 'reason': '普通单轮检索完成，按原始条件评估当前证据。',
-                     'queries': completed_queries, 'platform_stats': []}
-    pending_report = {'state': 'running', 'round': 1, 'progress': '', 'findings': [],
+    record.update(state='completed', new_results=len(results), total_results=len(results), reason='普通单轮检索完成，按原始条件评估当前证据。')
+    report_record = record
+    pending_report = {'state': 'running', 'round': round_number, 'progress': '', 'findings': [],
                       'message': 'AI 正在评估本轮搜索进展与继续搜索的可能性。',
                       'stats': {'new_results': len(results), 'updated_results': 0, 'total_results': len(results),
                                 'requests': len(external_statuses), 'failed_requests': sum(not item.get('ok') for item in external_statuses)},
@@ -452,15 +516,13 @@ def _run_single_search(job, config, storage, update):
     report_record['report'] = pending_report
     update(state='running', stage='reporting', progress=97, message='评估本轮进展、可推断信息与搜索成功可能性。',
            results=results, summary=summary, ai_summary=ai_summary, progress_report=pending_report,
-           round=1, rounds=[report_record], searches_count=len(external_statuses))
-    try:
-        progress_report = build_progress_report(query, results, {**config, 'use_ai': job['use_ai']},
-                                                plan, report_record, external_statuses)
-        if not isinstance(progress_report, dict):
-            raise ValueError('Invalid report')
-    except Exception:
+           round=round_number, rounds=rounds, searches_count=base_searches_count + completed)
+    outcome, progress_report = interruptible_call(lambda: build_progress_report(query, copy.deepcopy(results), {**config, 'use_ai': job['use_ai']},
+                                                copy.deepcopy(plan), copy.deepcopy(report_record), copy.deepcopy(external_statuses)), stop_event)
+    check_stopped()
+    if outcome != 'ok' or not isinstance(progress_report, dict):
         progress_report = {**pending_report, 'state': 'error', 'message': 'AI 进展报告暂未生成，搜索结果已保留。'}
     report_record['report'] = progress_report
     update(state='done', stage='done', progress=100, message='检索完成', results=results, summary=summary, ai_summary=ai_summary,
-           progress_report=progress_report, round=1, rounds=[report_record], searches_count=len(external_statuses),
+           progress_report=progress_report, round=round_number, rounds=rounds, searches_count=base_searches_count + completed,
            warnings=warnings, completed_at=datetime.now(timezone.utc).isoformat())

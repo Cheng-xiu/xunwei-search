@@ -5,7 +5,6 @@ late API response cannot erase results or resume a stopped search.
 """
 from __future__ import annotations
 
-import concurrent.futures as futures
 import copy
 from datetime import datetime, timezone
 import json
@@ -17,7 +16,8 @@ from . import providers
 from .safety import check_query
 from .summarizer import summarize_results
 from .progress_report import build_progress_report
-from .retrieval import DIRECT_PROVIDERS, depth_profile, anchor_coverage, is_excluded
+from .retrieval import (DIRECT_PROVIDERS, depth_profile, anchor_coverage, is_excluded,
+                        effective_search_concurrency, parallel_calls, interruptible_call, request_slot)
 
 MAX_REQUESTS = 20
 MAX_RESULTS = 240
@@ -33,23 +33,7 @@ def _now():
 
 
 def _interruptible(function, stop_event):
-    if stop_event.is_set():
-        return 'cancelled', None
-    pool = futures.ThreadPoolExecutor(max_workers=1)
-    task = pool.submit(function)
-    try:
-        while not task.done():
-            if stop_event.wait(0.1):
-                task.cancel()
-                return 'cancelled', None
-        if stop_event.is_set():
-            return 'cancelled', None
-        try:
-            return 'ok', task.result()
-        except Exception:
-            return 'error', None
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+    return interruptible_call(function, stop_event)
 
 
 def _query_key(provider, query, platform):
@@ -150,6 +134,7 @@ def run_adaptive_search(job, config, storage, update, stop_event):
     public_post_only = bool(job.get('public_post_only') or check_query(query).get('public_post_only'))
     use_ai = bool(job.get('use_ai', True))
     profile = depth_profile(job.get('depth'))
+    concurrency = effective_search_concurrency(job, config)
     config = {**config, '_cancel_event': stop_event, '_search_depth': job.get('depth', 'quick')}
     if re.search(r'\bissue\b|\bbug\b|\berror\b|故障|报错|不触发', query, re.I):
         config['_github_search_kind'] = 'issues'
@@ -158,7 +143,8 @@ def run_adaptive_search(job, config, storage, update, stop_event):
     statuses = copy.deepcopy(job.get('provider_status', []))[-MAX_STATUSES:]
     started_at = job.get('started_at') or _now()
     absolute_round = max(int(job.get('round', 0)), max((int(item.get('number', 0)) for item in rounds), default=0))
-    searches_count = int(job.get('searches_count', sum(len(item.get('queries', [])) for item in rounds)))
+    searches_count = int(job.get('searches_count', sum(task.get('status') == 'completed'
+                        for item in rounds for task in item.get('queries', []))))
     budget = max(0, min(12, int(job.get('max_rounds', 3))))
     summary = copy.deepcopy(job.get('ai_summary')) or {
         'state': 'empty' if use_ai else 'disabled', 'points': [], 'limitations': [],
@@ -248,7 +234,7 @@ def run_adaptive_search(job, config, storage, update, stop_event):
         update(results=copy.deepcopy(results), rounds=copy.deepcopy(rounds), provider_status=copy.deepcopy(statuses[-MAX_STATUSES:]),
                warnings=list(warnings), ai_summary=copy.deepcopy(summary), plan=copy.deepcopy(plan), round=absolute_round,
                progress_report=copy.deepcopy(progress_report),
-               searches_count=searches_count, started_at=started_at,
+               searches_count=searches_count, started_at=started_at, search_concurrency=concurrency,
                summary=f'已检索 {absolute_round} 轮，保留 {len(results)} 条候选；总结与结果会随新证据更新。', **fields)
 
     def finish(state, reason, message):
@@ -444,31 +430,30 @@ def run_adaptive_search(job, config, storage, update, stop_event):
         def request(task):
             if stop_event.is_set():
                 return {'results': [], 'status': {'provider': task['provider'], 'ok': False, 'cancelled': True}}
-            task['status'] = 'running'
             target = targets_by_id[task['platform']]
             limit = profile['limit']
-            if target.get('site') and task['provider'] not in direct:
-                return providers.search_custom_site(target['site'], task['query'], limit, {**config, '_engine': task['provider']})
-            scope = task['provider'] if target.get('site') else task['platform']
-            return providers.search_provider(task['provider'], task['query'], [scope], limit, config)
+            with request_slot(config, stop_event):
+                if target.get('site') and task['provider'] not in direct:
+                    return providers.search_custom_site(target['site'], task['query'], limit, {**config, '_engine': task['provider']})
+                scope = task['provider'] if target.get('site') else task['platform']
+                return providers.search_provider(task['provider'], task['query'], [scope], limit, config)
 
-        pool = futures.ThreadPoolExecutor(max_workers=4)
-        active = {}
         round_statuses = []
         completed = 0
 
-        def consume(future):
+        def consume(task, outcome, response):
             nonlocal completed, searches_count
-            task = active[future]
             try:
-                response = future.result()
-                if not isinstance(response, dict):
+                if outcome != 'ok' or not isinstance(response, dict):
                     raise ValueError('invalid response')
                 status = dict(response.get('status') or {'provider': task['provider'], 'ok': False})
-                for item in response.get('results', []):
-                    ingest(item, task['platform'], task['query'])
+                if not status.get('cancelled'):
+                    for item in response.get('results', []):
+                        ingest(item, task['platform'], task['query'])
             except Exception:
                 status = {'provider': task['provider'], 'ok': False, 'error': '来源请求失败或响应格式不兼容。'}
+                if outcome == 'cancelled':
+                    status['cancelled'] = True
             task['status'] = 'cancelled' if status.get('cancelled') else 'completed'
             if task['status'] == 'completed':
                 searched.add(_query_key(task['provider'], task['query'], task['platform']))
@@ -489,34 +474,15 @@ def run_adaptive_search(job, config, storage, update, stop_event):
             publish(state='running', stage='searching', progress=15 + round(45 * completed / len(tasks)),
                     message=f'第 {absolute_round} 轮已完成 {completed}/{len(tasks)} 个请求，结果持续保留。')
 
-        queue = list(tasks)
-        pending = set()
-        def schedule():
-            while queue and len(pending) < 4 and not stop_event.is_set():
-                task = queue.pop(0)
-                if task['provider'] in suppressed:
-                    task.update(status='skipped', reason='本段来源连续失败，暂停重复请求。')
-                    continue
-                future = pool.submit(request, task)
-                active[future] = task
-                pending.add(future)
-        schedule()
-        try:
-            while pending:
-                done, pending = futures.wait(pending, timeout=0.2, return_when=futures.FIRST_COMPLETED)
-                for future in done:
-                    consume(future)
-                schedule()
-                if stop_event.is_set():
-                    for future in list(pending):
-                        if future.done() and not future.cancelled():
-                            consume(future)
-                            pending.remove(future)
-                    for future in pending:
-                        future.cancel()
-                    break
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+        def schedule(task):
+            if task['provider'] in suppressed:
+                task.update(status='skipped', reason='本段来源连续失败，暂停重复请求。')
+                return False
+            task['status'] = 'running'
+        for task, outcome, response in parallel_calls(tasks, request, concurrency, stop_event, schedule):
+            if stop_if_requested():
+                return
+            consume(task, outcome, response)
         if stop_if_requested():
             return
 
@@ -536,16 +502,19 @@ def run_adaptive_search(job, config, storage, update, stop_event):
                 fetch_targets = list({result['id']: result for result in detailed + fetch_targets}.values())[:profile['pages']]
             if fetch_targets:
                 publish(state='running', stage='reading', progress=65, message=f'读取本轮最多 {profile["pages"]} 条来源的公开正文或回复。')
-            for result in fetch_targets:
-                detail_request = needs_details(result) and hasattr(providers, 'fetch_result_details')
-                if detail_request:
-                    outcome, page = _interruptible(lambda row=copy.deepcopy(result): providers.fetch_result_details(row, 12000, cancel_event=stop_event), stop_event)
-                else:
-                    fetched_urls.add(result['url'])
-                    outcome, page = _interruptible(lambda url=result['url']: providers.fetch_public_page(url, 12000, cancel_event=stop_event), stop_event)
+            readings = [(result, needs_details(result) and hasattr(providers, 'fetch_result_details')) for result in fetch_targets]
+            def read_source(reading):
+                result, detail_request = reading
+                with request_slot(config, stop_event):
+                    if detail_request:
+                        return providers.fetch_result_details(copy.deepcopy(result), 12000, cancel_event=stop_event)
+                    return providers.fetch_public_page(result['url'], 12000, cancel_event=stop_event)
+            for (result, detail_request), outcome, page in parallel_calls(readings, read_source, concurrency, stop_event):
                 if outcome == 'cancelled' or stop_if_requested():
                     stop_if_requested()
                     return
+                if not detail_request:
+                    fetched_urls.add(result['url'])
                 if outcome == 'ok' and isinstance(page, dict) and page.get('text') and not page.get('error'):
                     text = str(page['text'])
                     if detail_request:
@@ -564,6 +533,8 @@ def run_adaptive_search(job, config, storage, update, stop_event):
                     result['details_error'] = '公开回复暂无法读取，保留已取得的首楼正文。'
                 else:
                     result['fetch_error'] = '原文无法读取，保留可见标题和摘要。'
+            if stop_if_requested():
+                return
         if use_ai and new_candidates:
             publish(state='running', stage='evaluating', progress=76, message='核对本轮新候选与原问题的逐条证据。')
             checked = copy.deepcopy(new_candidates[:profile['candidates']])

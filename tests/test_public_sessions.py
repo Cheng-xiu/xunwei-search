@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from search_app.public_sessions import PublicSessions
+from search_app.public_sessions import LIMITS, PublicSessions
 from search_app.server import App, DEFAULTS, Handler, LocalHTTPServer
 from search_app.transport import PublicAccessError, TransportPolicy
 
@@ -138,6 +138,125 @@ class VisitorManagerTests(unittest.TestCase):
         with self.assertRaises(PublicAccessError) as error:
             self.manager.switch(session, 'shared')
         self.assertEqual(error.exception.status, 409)
+
+    def test_visitor_concurrency_limits_are_explicit_and_invalid_values_do_not_mutate(self):
+        _, session = self.create()
+        app = session.app
+        self.assertEqual(app.max_active_jobs, 2)
+        self.assertEqual(app.max_search_concurrency, 4)
+        app.save_config({'search_concurrency': 2})
+        prior = app.public_config()
+        job_id = 'c' * 32
+        app.storage.save_job({'id': job_id, 'query': '公开检索资料', 'state': 'done', 'results': [],
+                              'max_rounds': 1, 'search_concurrency': 2, 'created_at': '2026-10-08'})
+        with patch('search_app.server.threading.Thread') as worker:
+            for value in (0, -1, 5, 12, True, False, None, 2.0, '2', [], {}):
+                for operation in ('config', 'create', 'continue'):
+                    with self.subTest(value=value, operation=operation), self.assertRaises(ValueError):
+                        if operation == 'config':
+                            app.save_config({'search_concurrency': value})
+                        elif operation == 'create':
+                            app.create_job({'query': '公开检索资料', 'max_rounds': 1, 'search_concurrency': value})
+                        else:
+                            app.continue_job(job_id, {'max_rounds': 1, 'search_concurrency': value})
+            worker.assert_not_called()
+        self.assertEqual(app.public_config(), prior)
+        self.assertEqual(app.jobs, {})
+        self.assertEqual(app.get_job(job_id)['state'], 'done')
+
+    def test_shared_concurrency_setting_is_visitor_local_and_survives_mode_changes(self):
+        _, first = self.create('shared')
+        _, second = self.create('shared')
+        self.assertEqual(LIMITS['max_concurrent_jobs'], 4)
+        self.assertEqual(self.manager.capabilities()['public_limits']['max_session_jobs'], 2)
+        self.assertEqual(self.manager.capabilities()['public_limits']['search_concurrency'], 4)
+        first.app.save_config({'search_concurrency': 1})
+        self.assertEqual(first.app.public_config()['search_concurrency'], 1)
+        self.assertEqual(second.app.public_config()['search_concurrency'], 4)
+        self.assertEqual(first.app.config['api_key'], OWNER['AI_API_KEY'])
+        self.manager.switch(first, 'custom')
+        self.assertEqual(first.app.config['search_concurrency'], 1)
+        self.assertEqual(first.app.config['api_key'], '')
+        first.app.save_config({'search_concurrency': 4})
+        self.manager.switch(first, 'shared')
+        self.assertEqual(first.app.public_config()['search_concurrency'], 4)
+        self.assertFalse(first.app.config_path.exists())
+
+    def test_two_real_search_threads_overlap_and_stopping_one_preserves_the_other(self):
+        _, session = self.create('shared')
+        app = session.app
+        queries = ('公开甲方食堂菜品', '公开乙方固件故障')
+        started = {query: threading.Event() for query in queries}
+        release = {query: threading.Event() for query in queries}
+        finished = {query: threading.Event() for query in queries}
+        observed = {}
+        original = app._run
+
+        def run(job, config, storage, update):
+            query = job['query']
+            observed[query] = {'cancel': config['_cancel_event'], 'concurrency': job['search_concurrency']}
+            update(state='running', results=[{'id': job['id'], 'title': query}])
+            started[query].set()
+            release[query].wait(3)
+            update(state='done', results=[{'id': job['id'], 'title': query + '最终结果'}])
+
+        def tracked(job_id, config):
+            query = app.get_job(job_id)['query']
+            try:
+                return original(job_id, config)
+            finally:
+                finished[query].set()
+
+        ids = []
+        with patch('search_app.server.run_search', side_effect=run), patch.object(app, '_run', side_effect=tracked):
+            try:
+                for index, query in enumerate(queries):
+                    with self.manager.work_slot(session):
+                        ids.append(app.create_job({'query': query, 'max_rounds': 1, 'use_ai': False,
+                                                   'search_concurrency': index + 2})['job_id'])
+                    self.assertTrue(started[query].wait(1))
+                self.assertFalse(any(event.is_set() for event in finished.values()))
+                self.assertIsNot(observed[queries[0]]['cancel'], observed[queries[1]]['cancel'])
+                self.assertEqual([observed[query]['concurrency'] for query in queries], [2, 3])
+                with self.assertRaises(ValueError):
+                    app.create_job({'query': '第三个公开检索', 'max_rounds': 1, 'use_ai': False})
+                app.save_config({'search_concurrency': 4})
+                self.assertEqual(app.get_job(ids[0])['search_concurrency'], 2)
+                app.stop_job(ids[0])
+                self.assertTrue(observed[queries[0]]['cancel'].is_set())
+                self.assertFalse(observed[queries[1]]['cancel'].is_set())
+                self.assertEqual(app.get_job(ids[1])['state'], 'running')
+                release[queries[0]].set()
+                self.assertTrue(finished[queries[0]].wait(1))
+                self.assertEqual(app.get_job(ids[0])['state'], 'stopped')
+                self.assertEqual(app.get_job(ids[0])['results'][0]['title'], queries[0])
+                self.assertEqual(app.get_job(ids[1])['results'][0]['title'], queries[1])
+                release[queries[1]].set()
+                self.assertTrue(finished[queries[1]].wait(1))
+                self.assertEqual(app.get_job(ids[1])['state'], 'done')
+                self.assertEqual(app.get_job(ids[1])['results'][0]['title'], queries[1] + '最终结果')
+                self.assertEqual(app.storage.get_job(ids[0])['state'], 'stopped')
+                self.assertEqual(app.storage.get_job(ids[1])['state'], 'done')
+            finally:
+                for event in release.values():
+                    event.set()
+                for query in queries:
+                    if started[query].is_set():
+                        finished[query].wait(2)
+
+    def test_continue_accepts_public_boundary_and_preserves_other_jobs(self):
+        _, session = self.create()
+        app = session.app
+        with patch('search_app.server.threading.Thread'):
+            job_id = app.create_job({'query': '公开检索资料', 'max_rounds': 1,
+                                     'search_concurrency': 1, 'use_ai': False})['job_id']
+            app.stop_job(job_id)
+            other_id = app.create_job({'query': '另一个公开检索', 'max_rounds': 1,
+                                       'search_concurrency': 2, 'use_ai': False})['job_id']
+            app.continue_job(job_id, {'max_rounds': 1, 'search_concurrency': 4})
+        self.assertEqual(app.get_job(job_id)['search_concurrency'], 4)
+        self.assertEqual(app.get_job(other_id)['search_concurrency'], 2)
+        self.assertFalse(app.controls[other_id].is_set())
 
     def test_expiry_revokes_token_cancels_work_and_forbids_late_disk_writes(self):
         response, session = self.create()
@@ -380,6 +499,8 @@ class PublicHTTPTests(unittest.TestCase):
         self.assertTrue(health['shared_available'])
         self.assertTrue(health['session_required'])
         self.assertEqual(health['public_limits']['max_rounds'], 3)
+        self.assertEqual(health['public_limits']['max_session_jobs'], 2)
+        self.assertEqual(health['public_limits']['search_concurrency'], 4)
         self.assertEqual(health['public_limits']['max_documents'], 20)
         self.assertEqual(health['public_limits']['max_document_bytes'], 2_000_000)
         self.assertNotIn(OWNER['AI_API_KEY'], json.dumps(health))
@@ -418,6 +539,12 @@ class PublicHTTPTests(unittest.TestCase):
         app_a = self.manager.authenticate(token_a).app
         job = {'id': 'a' * 32, 'query': '访客一历史', 'state': 'done', 'results': [], 'created_at': '2026-10-08'}
         app_a.storage.save_job(job)
+        app_a.jobs[job['id']] = job
+        listing = self.request('GET', '/api/jobs', token=token_a)[2]
+        self.assertEqual([item['id'] for item in listing['items']], [job['id']])
+        self.assertEqual(listing['max_active_jobs'], 2)
+        self.assertEqual(listing['max_search_concurrency'], 4)
+        self.assertEqual(self.request('GET', '/api/jobs', token=token_b)[2]['items'], [])
         self.assertEqual(len(self.request('GET', '/api/history', token=token_a)[2]['items']), 1)
         self.assertEqual(self.request('GET', '/api/history', token=token_b)[2]['items'], [])
         self.assertEqual(self.request('GET', '/api/jobs/' + job['id'], token=token_b)[0], 404)

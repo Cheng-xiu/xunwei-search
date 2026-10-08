@@ -30,11 +30,13 @@ from .transport import CORS_HEADERS, CORS_METHODS, PublicAccessError, TransportP
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULTS = {'base_url': 'https://api.a6api.com/v1', 'model': 'deepseek-v4.1-flash',
             'api_key': '', 'tavily_key': '', 'brave_key': '', 'searxng_url': '',
-            'custom_sites': [], 'search_engines': []}
+            'custom_sites': [], 'search_engines': [], 'search_concurrency': 4}
 SECRET_KEYS = ('api_key', 'tavily_key', 'brave_key')
 FINISHED_STATES = ('done', 'stopped', 'awaiting_user', 'error')
 PUBLIC_READ_TIMEOUT = 10.0
 PUBLIC_MAX_CONNECTIONS = 64
+MAX_ACTIVE_JOBS = 4
+MAX_SEARCH_CONCURRENCY = 12
 
 
 def round_budget(value):
@@ -51,6 +53,12 @@ def normalize_search_engines(value):
     return list(dict.fromkeys(value))
 
 
+def validate_search_concurrency(value, max_concurrency=MAX_SEARCH_CONCURRENCY):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= max_concurrency:
+        raise ValueError(f'并发检索数须为 1–{max_concurrency} 的整数。')
+    return value
+
+
 class App:
     def __init__(self, data_dir=None, *, environment=True, persist_settings=True, storage_factory=Storage):
         self.data_dir = Path(data_dir or os.environ.get('XUNWEI_DATA_DIR') or ROOT / '.local')
@@ -64,13 +72,17 @@ class App:
         self.controls = {}
         self.epochs = {}
         self.previous_summaries = {}
+        self.max_active_jobs = MAX_ACTIVE_JOBS
+        self.max_search_concurrency = MAX_SEARCH_CONCURRENCY
         self.config = copy.deepcopy(DEFAULTS)
         if persist_settings and self.config_path.exists():
             try:
                 data = json.loads(self.config_path.read_text(encoding='utf-8-sig'))
-                self.config.update({k: v for k, v in data.items() if k in DEFAULTS and isinstance(v, str)})
+                self.config.update({k: v for k, v in data.items()
+                                    if k in DEFAULTS and isinstance(DEFAULTS[k], str) and isinstance(v, str)})
                 self.config['custom_sites'] = normalize_custom_sites(data.get('custom_sites', []))
                 self.config['search_engines'] = normalize_search_engines(data.get('search_engines', []))
+                self.config['search_concurrency'] = validate_search_concurrency(data.get('search_concurrency', 4))
             except (ValueError, OSError):
                 print('本地配置无法读取，已使用默认配置。请在设置中重新保存。')
         for setting, env in [('api_key', 'AI_API_KEY'), ('base_url', 'AI_BASE_URL'), ('model', 'AI_MODEL'),
@@ -95,6 +107,9 @@ class App:
                     continue
                 if key == 'search_engines':
                     config[key] = normalize_search_engines(value)
+                    continue
+                if key == 'search_concurrency':
+                    config[key] = validate_search_concurrency(value, self.max_search_concurrency)
                     continue
                 if not isinstance(value, str) or len(value) > 4096 or any(c in value for c in '\r\n\x00'):
                     raise ValueError('配置字段须为单行文本。')
@@ -138,8 +153,8 @@ class App:
         if depth not in ('quick', 'deep', 'research'):
             raise ValueError('检索深度须为 quick、deep 或 research。')
         with self.lock:
-            if sum(j['state'] in ('queued', 'running') for j in self.jobs.values()) + len(self.summary_jobs) >= 2:
-                raise ValueError('已有两个搜索或总结任务正在运行，请等待完成。')
+            concurrency = validate_search_concurrency(data.get('search_concurrency', self.config['search_concurrency']), self.max_search_concurrency)
+            self._check_job_capacity()
             if len(self.jobs) > 100:
                 for key in list(self.jobs):
                     if self.jobs[key]['state'] in FINISHED_STATES and key not in self.summary_jobs:
@@ -152,6 +167,7 @@ class App:
             job_id = uuid.uuid4().hex
             job = {'id': job_id, 'query': query, 'platforms': list(dict.fromkeys(platforms)), 'depth': depth,
                    'search_engines': [item for item in available_providers(self.config) if item in SEARCH_ENGINE_IDS],
+                   'search_concurrency': concurrency,
                    'custom_sites': sites, 'adaptive': data.get('adaptive', True) is True,
                    'max_rounds': max_rounds, 'round': 0, 'rounds': [], 'searches_count': 0,
                    'use_ai': data.get('use_ai', True) is True, 'fetch_pages': data.get('fetch_pages', True) is True,
@@ -220,6 +236,29 @@ class App:
                 return copy.deepcopy(job)
         return self.storage.get_job(job_id)
 
+    def _active_job_count(self):
+        return sum(j['state'] in ('queued', 'running') for j in self.jobs.values()) + len(self.summary_jobs)
+
+    def _check_job_capacity(self):
+        # The caller holds self.lock, so simultaneous HTTP requests cannot
+        # both reserve the same remaining job slot.
+        if self._active_job_count() >= self.max_active_jobs:
+            raise ValueError(f'已有 {self.max_active_jobs} 个搜索或总结任务正在运行，请等待或停止部分任务。')
+
+    def list_jobs(self):
+        with self.lock:
+            fields = ('id', 'query', 'state', 'stage', 'progress', 'message', 'round', 'created_at',
+                      'resumed_at', 'depth', 'max_rounds', 'search_concurrency')
+            items = []
+            for job in self.jobs.values():
+                item = {key: copy.deepcopy(job[key]) for key in fields if key in job}
+                item.update(ai_summary_state=(job.get('ai_summary') or {}).get('state', 'empty'),
+                            active=job['state'] in ('queued', 'running') or job['id'] in self.summary_jobs)
+                items.append(item)
+            items.sort(key=lambda item: item.get('created_at', ''), reverse=True)
+            return {'items': items, 'active_jobs': self._active_job_count(),
+                    'max_active_jobs': self.max_active_jobs, 'max_search_concurrency': self.max_search_concurrency}
+
     def create_summary(self, job_id):
         with self.lock:
             job = self.get_job(job_id)
@@ -236,8 +275,7 @@ class App:
                 raise ValueError(safety['message'])
             if not self.config.get('api_key'):
                 raise ValueError('请先在设置中填写 AI API 密钥，再生成总结。')
-            if sum(j['state'] in ('queued', 'running') for j in self.jobs.values()) + len(self.summary_jobs) >= 2:
-                raise ValueError('已有两个搜索或总结任务正在运行，请等待完成。')
+            self._check_job_capacity()
             # Persist the completed retrieval before changing the epoch: an
             # immediate manual action must not race away its final save.
             self.storage.save_job(copy.deepcopy(job))
@@ -322,8 +360,7 @@ class App:
                 raise LookupError('搜索记录不存在。')
             if job['state'] not in ('done', 'awaiting_user', 'stopped') or job_id in self.summary_jobs:
                 raise ValueError('请等待当前搜索或总结结束后再继续。')
-            if sum(j['state'] in ('queued', 'running') for j in self.jobs.values()) + len(self.summary_jobs) >= 2:
-                raise ValueError('已有两个搜索或总结任务正在运行，请等待完成。')
+            self._check_job_capacity()
             safety = check_query(job.get('query', ''))
             if not safety['allowed']:
                 raise ValueError(safety['message'])
@@ -331,9 +368,11 @@ class App:
             depth = data.get('depth', job.get('depth', 'quick'))
             if depth not in ('quick', 'deep', 'research'):
                 raise ValueError('检索深度须为 quick、deep 或 research。')
+            concurrency = validate_search_concurrency(data.get('search_concurrency', self.config['search_concurrency']), self.max_search_concurrency)
             self.storage.save_job(copy.deepcopy(job))
             job.update(state='queued', stage='adapting', progress=0, adaptive=True, max_rounds=budget, depth=depth,
                        search_engines=[item for item in available_providers(self.config) if item in SEARCH_ENGINE_IDS],
+                       search_concurrency=concurrency,
                        message='准备根据已有线索继续深挖。', resumed_at=datetime.now(timezone.utc).isoformat())
             job.pop('stop_reason', None)
             job.pop('completed_at', None)
@@ -572,7 +611,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, self.app.public_config())
         if path == '/api/health':
             capabilities = self.public_sessions.capabilities() if self.public_sessions else {'public_mode': False, 'session_required': False, 'shared_available': False}
-            return self.respond(200, {'ok': True, 'version': '1.4.0', 'features': ['ai_summary', 'adaptive_search', 'stop_resume', 'custom_sites', 'round_progress_reports', 'direct_longtail_sources', 'research_depth', 'multi_engine_search'], **capabilities})
+            public_limits = capabilities.get('public_limits', {})
+            search_limits = {'max_active_jobs': public_limits.get('max_session_jobs', self.app.max_active_jobs),
+                             'max_search_concurrency': public_limits.get('search_concurrency', self.app.max_search_concurrency)}
+            return self.respond(200, {'ok': True, 'version': '1.4.0', 'features': ['ai_summary', 'adaptive_search', 'stop_resume', 'custom_sites', 'round_progress_reports', 'direct_longtail_sources', 'research_depth', 'multi_engine_search', 'concurrent_search'],
+                                     'search_limits': search_limits, **capabilities})
         if path == '/api/session' and self.public_sessions:
             if self._visitor is None:
                 raise PublicAccessError(403, '管理令牌不属于访客会话，请创建独立访客会话。')
@@ -589,6 +632,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, {'items': docs})
         if path == '/api/history':
             return self.respond(200, {'items': self.app.storage.list_history()})
+        if path == '/api/jobs':
+            return self.respond(200, self.app.list_jobs())
         if path.startswith('/api/jobs/'):
             job = self.app.get_job(path.rsplit('/', 1)[-1])
             return self.respond(200, job) if job else self.respond(404, {'error': '搜索记录不存在。'})

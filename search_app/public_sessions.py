@@ -17,12 +17,13 @@ import uuid
 
 from .ai import validate_base_url
 from .providers import canonical_url
-from .server import App, DEFAULTS, round_budget
+from .server import App, DEFAULTS, round_budget, validate_search_concurrency
 from .storage import Storage, _safe
 from .transport import PublicAccessError
 
 
-LIMITS = {'max_rounds': 3, 'max_concurrent_jobs': 4, 'session_ttl_seconds': 3600,
+LIMITS = {'max_rounds': 3, 'max_concurrent_jobs': 4, 'max_session_jobs': 2,
+          'search_concurrency': 4, 'session_ttl_seconds': 3600,
           'max_sessions': 20, 'requests_per_minute': 240, 'expensive_requests_per_minute': 6,
           'max_documents': 20, 'max_document_bytes': 2_000_000}
 AI_FIELDS = frozenset(('api_key', 'base_url', 'model'))
@@ -75,6 +76,11 @@ class VisitorApp(App):
         self._revoked = False
         self.lifetime_cancel = threading.Event()
         super().__init__(directory, environment=False, persist_settings=False, storage_factory=SessionStorage)
+        self.max_active_jobs = LIMITS['max_session_jobs']
+        self.max_search_concurrency = LIMITS['search_concurrency']
+        # A local installation may have a larger default. Only this internal
+        # default is bounded; explicit visitor values are validated, not clipped.
+        self.config['search_concurrency'] = min(self.config.get('search_concurrency', 4), LIMITS['search_concurrency'])
         self._custom_config = copy.deepcopy(self.config)
         self.config = self._config_for(mode)
 
@@ -113,6 +119,8 @@ class VisitorApp(App):
             self._ensure_active()
             if 'api_mode' in data or 'mode' in data:
                 raise ValueError('请使用会话模式接口切换共享或自配 API。')
+            if 'search_concurrency' in data:
+                validate_search_concurrency(data['search_concurrency'], max_concurrency=LIMITS['search_concurrency'])
             clearing = data.get('clear_secrets', [])
             if self.mode == 'shared' and (AI_FIELDS.intersection(data) or
                     isinstance(clearing, list) and 'api_key' in clearing):
@@ -139,6 +147,8 @@ class VisitorApp(App):
         with self.lock:
             self._ensure_active()
             self._budget(data)
+            validate_search_concurrency(data.get('search_concurrency', self.config['search_concurrency']),
+                                        max_concurrency=LIMITS['search_concurrency'])
             return super().create_job(data)
 
     def continue_job(self, job_id, data):
@@ -146,6 +156,8 @@ class VisitorApp(App):
             self._ensure_active()
             job = self.get_job(job_id)
             self._budget(data, (job or {}).get('max_rounds', 3))
+            validate_search_concurrency(data.get('search_concurrency', self.config['search_concurrency']),
+                                        max_concurrency=LIMITS['search_concurrency'])
             return super().continue_job(job_id, data)
 
     def create_summary(self, job_id):

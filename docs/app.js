@@ -19,6 +19,12 @@
   let engineSelectionSupported = false;
   let engineDraftIds = null;
   const engineNames = { baidu: '百度', bing: '必应 Bing', google: 'Google', yandex: 'Yandex', duckduckgo: 'DuckDuckGo', tavily: 'Tavily', brave: 'Brave Search', searxng: 'SearXNG' };
+  const tasks = new Map();
+  let taskEpoch = 0;
+  let submissionBusy = false;
+  let serverTaskLimit = 0;
+  let taskListing = false;
+  let composerVersion = 0;
 
   function node(tag, className, content) {
     const element = document.createElement(tag);
@@ -125,6 +131,8 @@
     renderOfflineLinks();
     updateModelModes();
     updateAdaptiveControls();
+    updateConcurrencyControl();
+    renderTasks();
   }
 
   function updateModelModes() {
@@ -136,7 +144,7 @@
       const selected = backend.connected && button.dataset.modelMode === mode;
       button.classList.toggle('selected', selected);
       button.setAttribute('aria-pressed', String(selected));
-      button.disabled = state.busy || modelModeBusy || (backend.connected && button.dataset.modelMode === 'shared' && !available);
+      button.disabled = anyTaskActive() || modelModeBusy || (backend.connected && button.dataset.modelMode === 'shared' && !available);
       button.title = backend.connected && button.dataset.modelMode === 'shared' && !available ? '该服务尚未向此连接开放站主 API。' : '';
     });
     $('#shared-mode-description').textContent = !backend.connected ? '需要连接服务；尚未确认站主是否开放' : available ? '站主已开放，无需填写模型密钥' : '此服务尚未开放站主 API';
@@ -145,7 +153,7 @@
     $('#model-mode-note').textContent = !backend.connected ? '两种方式均需要连接搜索服务。静态页面本身不提供 AI 额度。' : backend.visitorSession ? '你的历史、资料与 API 配置按访客会话隔离。API 密钥由连接的服务代为调用，请使用你信任的服务。' : '当前是私人服务连接；只有提供独立访客会话的公开服务才可选择站主 API。';
     toggle($('#settings-model-control'), backend.visitorSession);
     $('#settings-model-mode').value = mode;
-    $('#settings-model-mode').disabled = state.busy || modelModeBusy;
+    $('#settings-model-mode').disabled = anyTaskActive() || modelModeBusy;
     $('#settings-model-mode option[value="shared"]').disabled = !available;
     const readonly = state.config?.ai_config_readonly === true || (backend.visitorSession && mode === 'shared');
     toggle($('#custom-ai-settings'), !readonly);
@@ -158,7 +166,7 @@
   }
 
   async function changeModelMode(mode, showSettings = false) {
-    if (!['shared','custom'].includes(mode) || modelModeBusy || state.busy) return;
+    if (!['shared','custom'].includes(mode) || modelModeBusy || anyTaskActive()) return;
     const backend = connection.snapshot();
     if (!backend.connected) { requestedModelMode = mode; openBackend(); return; }
     if (!backend.visitorSession) { if (mode === 'custom') openSettings(); return; }
@@ -210,6 +218,12 @@
   }
 
   function resetBackendView() {
+    taskEpoch += 1;
+    tasks.forEach(entry => { entry.generation += 1; });
+    tasks.clear();
+    submissionBusy = false;
+    serverTaskLimit = 0;
+    taskListing = false;
     state.pollToken += 1;
     Object.assign(state, { config: null, job: null, activeJobId: '', stopRequested: false, lastResults: '', lastAISummary: '', lastRounds: '', summaryPending: false, summaryError: '', history: [], library: [], sitesDirty: false, filter: 'all', views: 'all' });
     resetProgressReport();
@@ -240,7 +254,7 @@
   }
 
   async function refreshBackendData() {
-    await Promise.allSettled([loadConfig(), loadHistory(), loadLibrary(), loadPlatforms(), loadSearchEngines()]);
+    await Promise.allSettled([loadConfig(), loadHistory(), loadLibrary(), loadPlatforms(), loadSearchEngines(), loadTasks()]);
     updateConnection();
   }
 
@@ -363,6 +377,7 @@
   function selectPlatform(button) {
     if (!button?.dataset.platform) return;
     const id=button.dataset.platform;
+    composerVersion += 1;
     state.platformSelectionEdited=true;
     if (state.selectedPlatforms.has(id)) state.selectedPlatforms.delete(id);
     else state.selectedPlatforms.add(id);
@@ -491,6 +506,7 @@
     updateSecretLabels(config);
     updateModelModes();
     renderEngineChoices();
+    updateConcurrencyControl(config.search_concurrency);
   }
 
   function updateSecretLabels(config) {
@@ -502,6 +518,11 @@
   function settingsPayload() {
     const readonly = state.config?.ai_config_readonly === true || (connection.snapshot().visitorSession && (state.config?.api_mode || connection.snapshot().sessionMode) === 'shared');
     const payload = { searxng_url: $('#searxng-url').value.trim(), clear_secrets: [] };
+    if (supportsConcurrentSearch()) {
+      const concurrency = Number($('#search-concurrency').value);
+      if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > concurrencyLimit()) throw new Error(`来源检索并发数需要是 1–${concurrencyLimit()} 的整数。`);
+      payload.search_concurrency = concurrency;
+    }
     if (engineSelectionSupported) {
       payload.search_engines = $$('#search-engine-options input:checked').map(input => input.value);
       if (!payload.search_engines.length) throw new Error('请至少选择一个搜索引擎。');
@@ -546,107 +567,212 @@
     finally { $('#save-settings').disabled = false; $('#test-ai').disabled = false; }
   }
 
+  function supportsConcurrentSearch() { return connection.snapshot().features.includes('concurrent_search'); }
+  function concurrencyLimit() {
+    const backend = connection.snapshot();
+    return Math.max(1, Math.min(12, Number(backend.visitorSession ? backend.publicLimits.search_concurrency || 4 : backend.searchLimits.max_search_concurrency || 12)));
+  }
+  function updateConcurrencyControl(value) {
+    const input = $('#search-concurrency');
+    const supported = supportsConcurrentSearch();
+    input.disabled = !supported;
+    input.max = String(concurrencyLimit());
+    if (value !== undefined || !$('#settings-dialog').open) input.value = String(Math.max(1, Math.min(concurrencyLimit(), Number.isInteger(value) ? value : Number.isInteger(state.config?.search_concurrency) ? state.config.search_concurrency : 4)));
+    $('#search-concurrency-hint').textContent = !supported ? '兼容默认：当前服务未提供并发设置，使用服务默认值 4。' : `每个问题同时查询 ${1}–${concurrencyLimit()} 个来源，默认 4；与同时搜索的问题数量独立。`;
+  }
+  function taskLimit() {
+    const backend = connection.snapshot();
+    if (!supportsConcurrentSearch()) return 1;
+    return serverTaskLimit || Number(backend.visitorSession ? backend.publicLimits.max_session_jobs || 2 : backend.searchLimits.max_active_jobs || 4);
+  }
+  function taskActive(entry) { return Boolean(entry && (entry.operation || entry.stopPending || ['queued', 'running'].includes(entry.job.state) || entry.job.ai_summary?.state === 'running' || (!entry.full && entry.job.active))); }
+  function activeTaskCount() { return Array.from(tasks.values()).filter(taskActive).length; }
+  function anyTaskActive() { return submissionBusy || activeTaskCount() > 0; }
+  function hasTaskCapacity() { return activeTaskCount() + Number(submissionBusy) < taskLimit(); }
+  function currentTask() { return tasks.get(state.activeJobId); }
+
+  function updateSubmitButton() {
+    const button = $('#search-button');
+    const connected = connection.snapshot().connected;
+    button.disabled = submissionBusy || (connected && !hasTaskCapacity());
+    button.querySelector('span').textContent = submissionBusy ? '创建任务…' : !connected ? '连接后搜索' : !hasTaskCapacity() ? '运行任务已满' : state.activeJobId ? '作为新任务搜索' : '开始搜索';
+    button.title = connected && !hasTaskCapacity() ? `最多同时运行 ${taskLimit()} 个搜索或总结任务。可先停止一个任务。` : '';
+  }
+
+  function renderTasks() {
+    const container = $('#search-tasks');
+    const focusedId = document.activeElement?.dataset.taskId;
+    container.replaceChildren();
+    const statuses = { queued: '等待中', running: '搜索中', done: '已完成', awaiting_user: '等待继续', stopped: '已停止', error: '失败' };
+    tasks.forEach(entry => {
+      const job = entry.job;
+      const button = node('button', 'search-task');
+      button.type = 'button';
+      button.dataset.taskId = entry.id;
+      const selected = state.activeJobId === entry.id;
+      button.classList.toggle('selected', selected);
+      button.setAttribute('aria-pressed', String(selected));
+      const active = taskActive(entry);
+      const label = entry.stopRequested ? '停止中' : entry.error ? '连接中断' : entry.operation === 'summary' || job.ai_summary?.state === 'running' ? '总结中' : statuses[job.state] || '读取中';
+      button.append(node('strong', '', job.query || '正在读取问题…'), node('span', active ? 'task-state active' : 'task-state', `${label}${active && Number.isFinite(Number(job.progress)) ? ` · ${Math.round(Number(job.progress))}%` : ''}`));
+      button.title = `${job.query || '搜索任务'} · ${entry.error || job.message || label}`;
+      button.addEventListener('click', () => selectTask(entry.id));
+      container.append(button);
+      if (focusedId === entry.id) button.focus({ preventScroll: true });
+    });
+    const backend = connection.snapshot();
+    $('#task-capacity-note').textContent = !backend.connected ? '连接服务后可同时搜索多个问题。' : `${activeTaskCount()} / ${taskLimit()} 个任务运行中${supportsConcurrentSearch() ? ' · 切换任务不会中断搜索' : ' · 当前服务使用单任务兼容模式'}`;
+    $('#selected-task-note').textContent = state.activeJobId ? `当前查看：${currentTask()?.job.query || state.job?.query || '正在读取'}。停止与继续仅作用于此任务。` : '新问题 · 其他任务会继续搜索';
+    updateSubmitButton();
+  }
+
+  function acceptTask(job, full = true) {
+    const id = String(job.id || '');
+    if (!id) return null;
+    let entry = tasks.get(id);
+    if (!entry) { entry = { id, job: {}, full: false, generation: 0, polling: false, operation: '', stopRequested: false, stopPending: false, error: '', summaryError: '', view: null }; tasks.set(id, entry); }
+    entry.job = full ? job : { ...entry.job, ...job };
+    if (!full && typeof job.ai_summary_state === 'string') entry.job.ai_summary = { ...(entry.job.ai_summary || {}), state: job.ai_summary_state };
+    entry.full ||= full;
+    if (full) { entry.error = ''; if (!taskActive(entry)) entry.stopRequested = false; }
+    return entry;
+  }
+
+  function rememberTaskView() {
+    const entry = currentTask();
+    if (!entry) return;
+    entry.view = { filter: state.filter, views: state.views, previousReadyReport: state.previousReadyReport, displayedReport: state.displayedReport, reportJobId: state.reportJobId, reportClockKey: state.reportClockKey, reportStartedAt: state.reportStartedAt };
+  }
+
+  function clearTaskView() {
+    state.job = null; state.activeJobId = ''; state.stopRequested = false;
+    state.filter = 'all'; state.views = 'all'; state.lastResults = ''; state.lastAISummary = ''; state.lastRounds = '';
+    state.summaryPending = false; state.summaryError = ''; resetProgressReport();
+    $('#views-filter').value = 'all';
+    $$('[data-filter]').forEach(button => { button.classList.toggle('active', button.dataset.filter === 'all'); button.setAttribute('aria-pressed', String(button.dataset.filter === 'all')); });
+    ['export-results','result-tools','answer-summary','ai-summary-card','native-links-section','engine-links-section','rounds-card','job-status-panel','progress-panel'].forEach(id => toggle($(`#${id}`), false));
+    $('#rounds-timeline').replaceChildren(); $('#search-warnings').replaceChildren(); $('#result-count').textContent = '0';
+    $('#results').replaceChildren(empty('为新问题寻找线索', '其他任务会继续运行，可通过上方任务列表随时切换。'));
+    $('#search-plan').replaceChildren(node('p', 'plan-intent', '新任务会独立拆解问题、检索并核对证据。'));
+    $('#provider-status').replaceChildren(node('p', 'subtle', '新任务尚未开始'));
+    notice('#search-notice', ''); setBusy(false);
+  }
+
+  function newSearch() {
+    rememberTaskView(); state.pollToken += 1; composerVersion += 1; clearTaskView();
+    $('#query').value = ''; showView('search'); renderTasks(); $('#query').focus();
+  }
+
+  function restoreTaskForm(job) {
+    $('#query').value = job.query || '';
+    if (typeof job.use_ai === 'boolean') $('#use-ai').checked = job.use_ai;
+    if (typeof job.adaptive === 'boolean') $('#adaptive-search').checked = job.adaptive;
+    if ([0,3,6,12].includes(job.max_rounds)) $('#max-rounds').value = String(job.max_rounds);
+    $('#search-depth').value = ['quick','deep','research'].includes(job.depth) ? job.depth : 'deep'; updateDepthDescription();
+    if (typeof job.fetch_pages === 'boolean') $('#fetch-pages').checked = job.fetch_pages;
+    if (Array.isArray(job.platforms)) { state.selectedPlatforms = new Set(job.platforms); state.platformSelectionEdited = true; syncPlatformSelection(); }
+    if (Array.isArray(job.custom_sites)) { renderSiteRows(job.custom_sites); state.sitesDirty = true; }
+  }
+
+  function displayTask(entry) {
+    if (state.activeJobId !== entry.id) return;
+    state.job = entry.job; state.stopRequested = entry.stopRequested;
+    state.summaryPending = entry.operation === 'summary'; state.summaryError = entry.summaryError;
+    setBusy(taskActive(entry), entry.operation === 'summary' || entry.job.ai_summary?.state === 'running' ? 'summary' : 'search');
+    renderJob(entry.job);
+    notice('#search-notice', entry.error || (entry.job.state === 'error' ? entry.job.error || entry.job.message || '搜索未能完成。' : ''));
+  }
+
+  function selectTask(id, query = '') {
+    rememberTaskView(); state.pollToken += 1; clearTaskView();
+    const entry = tasks.get(id) || acceptTask({ id, query }, false);
+    state.activeJobId = id;
+    entry.restoreVersion = ++composerVersion;
+    if (entry.view) { Object.assign(state, entry.view); $('#views-filter').value = state.views; $$('[data-filter]').forEach(button => { const selected = button.dataset.filter === state.filter; button.classList.toggle('active', selected); button.setAttribute('aria-pressed', String(selected)); }); }
+    restoreTaskForm(entry.job); showView('search'); displayTask(entry); renderTasks();
+    startTaskPolling(entry);
+  }
+
+  async function loadTasks() {
+    if (!connection.snapshot().connected || !supportsConcurrentSearch() || taskListing) return;
+    const epoch = taskEpoch; taskListing = true;
+    try {
+      const data = await api('/api/jobs');
+      if (epoch !== taskEpoch) return;
+      if (Number.isInteger(data.max_active_jobs) && data.max_active_jobs > 0) serverTaskLimit = data.max_active_jobs;
+      (Array.isArray(data.items) ? data.items : []).forEach(job => {
+        const existing = tasks.get(String(job.id || ''));
+        const entry = existing?.full ? existing : acceptTask(job, false);
+        if (entry && (taskActive(entry) || job.active || ['queued','running'].includes(job.state) || job.ai_summary_state === 'running' || state.activeJobId === entry.id)) startTaskPolling(entry);
+      });
+      renderTasks(); updateModelModes();
+    } catch (error) { if (error.code !== 'BACKEND_CHANGED' && error.status !== 404 && error.status !== 401) $('#task-capacity-note').textContent = `任务列表暂时不可用：${error.message}`; }
+    finally { if (epoch === taskEpoch) taskListing = false; }
+  }
+
   function setBusy(busy, mode = 'search') {
-    state.busy = busy;
-    state.busyMode = mode;
-    $('#search-button').disabled = busy;
-    $('#search-button span').textContent = busy ? (mode === 'summary' ? '总结中…' : '搜索中…') : connection.snapshot().connected ? '开始搜索' : '连接后搜索';
-    $('#search-form').setAttribute('aria-busy', String(busy));
-    renderAISummary(state.job);
-    renderJobControls();
-    updateModelModes();
+    state.busy = busy; state.busyMode = mode;
+    $('#search-form').setAttribute('aria-busy', String(submissionBusy));
+    renderAISummary(state.job); renderJobControls(); updateModelModes(); renderTasks();
   }
 
   async function startSearch(event) {
     if (event) event.preventDefault();
-    if (!ensureBackend()) return;
-    if (state.busy) return;
+    if (!ensureBackend() || submissionBusy) return;
+    if (!hasTaskCapacity()) { notice('#search-notice', `当前已达到 ${taskLimit()} 个并行任务，请等待或停止一个任务后再创建。`); loadTasks(); return; }
     if (connection.snapshot().visitorSession && $('#use-ai').checked && state.config?.api_mode === 'custom' && !state.config?.has_api_key) { toast('请先为当前访客会话配置自己的模型 API。'); openSettings(); return; }
-    const query = $('#query').value.trim();
-    const platforms = Array.from(state.selectedPlatforms);
-    let customSites;
-    try { customSites = collectSites(); }
-    catch (error) { $('#custom-sites-panel').open = true; notice('#custom-sites-feedback', error.message); return; }
-    if (!query) { $('#query').focus(); return; }
+    const query = $('#query').value.trim(); const platforms = Array.from(state.selectedPlatforms); let customSites;
+    try { customSites = collectSites(); } catch (error) { $('#custom-sites-panel').open = true; notice('#custom-sites-feedback', error.message); return; }
     if (query.length < 2 || query.length > 500) { notice('#search-notice', '请用 2–500 个字符描述你想搜索的内容。'); return; }
     if (!platforms.length && !customSites.length) { notice('#search-notice', '请至少选择一个搜索平台，或添加一个指定网站。'); return; }
-    state.platformSelectionEdited = true;
-    const token = ++state.pollToken;
-    state.job = null;
-    state.activeJobId = '';
-    state.stopRequested = false;
-    state.filter = 'all';
-    state.views = 'all';
-    state.lastResults = '';
-    state.lastAISummary = '';
-    state.lastRounds = '';
-    resetProgressReport();
-    state.summaryPending = false;
-    state.summaryError = '';
-    $('#views-filter').value = 'all';
-    $$('[data-filter]').forEach(button => { button.classList.toggle('active', button.dataset.filter === 'all'); button.setAttribute('aria-pressed', String(button.dataset.filter === 'all')); });
-    notice('#search-notice', '');
-    $('#search-warnings').replaceChildren();
-    $('#result-count').textContent = '0';
-    toggle($('#export-results'), false);
-    toggle($('#result-tools'), false);
-    toggle($('#answer-summary'), false);
-    toggle($('#ai-summary-card'), false);
-    toggle($('#native-links-section'), false);
-    toggle($('#rounds-card'), false);
-    toggle($('#job-status-panel'), false);
-    $('#rounds-timeline').replaceChildren();
-    $('#results').replaceChildren(empty('正在寻找相关线索', '搜索需要一点时间。可在右侧查看问题拆解与检索服务的状态。'));
-    $('#search-plan').replaceChildren(node('p', 'plan-intent', '正在根据你的问题生成搜索思路…'));
-    $('#provider-status').replaceChildren(node('p', 'subtle', '正在准备检索服务…'));
-    setBusy(true);
-    showProgress({ stage: 'planning', progress: 0, message: '正在创建搜索任务…' });
+    const body = { query, platforms, depth: searchDepth(), use_ai: $('#use-ai').checked, adaptive: $('#adaptive-search').checked && $('#use-ai').checked, max_rounds: roundBudget(), custom_sites: customSites, fetch_pages: $('#fetch-pages').checked, only_verified: false };
+    rememberTaskView(); clearTaskView(); const viewToken = ++state.pollToken; const epoch = taskEpoch;
+    state.platformSelectionEdited = true; submissionBusy = true; renderTasks(); updateModelModes();
+    showProgress({ stage: 'planning', progress: 0, message: '正在创建独立搜索任务…' });
     try {
-      const result = await api('/api/search', { method: 'POST', body: { query, platforms, depth: searchDepth(), use_ai: $('#use-ai').checked, adaptive: $('#adaptive-search').checked && $('#use-ai').checked, max_rounds: roundBudget(), custom_sites: customSites, fetch_pages: $('#fetch-pages').checked, only_verified: false } });
-      if (!result.job_id) throw new Error('服务没有返回搜索任务编号，请重试。');
-      if (token !== state.pollToken) return;
-      state.activeJobId = result.job_id;
-      renderJobControls();
-      await pollJob(result.job_id, token);
+      const response = await api('/api/search', { method: 'POST', body });
+      if (epoch !== taskEpoch) return;
+      if (!response.job_id) throw new Error('服务没有返回搜索任务编号，请重试。');
+      const entry = acceptTask({ ...body, id: response.job_id, state: 'queued', stage: 'queued', progress: 0, results: [], search_engines: state.config?.search_engines || [] });
+      submissionBusy = false;
+      if (viewToken === state.pollToken) selectTask(entry.id); else startTaskPolling(entry);
     } catch (error) {
-      if (token !== state.pollToken) return;
-      if (state.job?.ai_summary?.state === 'running') state.summaryError = error.message;
-      setBusy(false);
-      toggle($('#progress-panel'), false);
-      notice('#search-notice', error.message);
-      if (!state.job || !(state.job.results || []).length) $('#results').replaceChildren(empty('这次搜索未能完成', '请根据上方提示检查连接或修改条件，然后重新搜索。'));
-    }
+      if (epoch !== taskEpoch) return;
+      if (viewToken === state.pollToken) { toggle($('#progress-panel'), false); notice('#search-notice', error.message); }
+      else toast(error.message);
+      loadTasks();
+    } finally { if (epoch === taskEpoch) { submissionBusy = false; renderTasks(); updateModelModes(); } }
   }
 
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-  async function pollJob(id, token) {
-    let failures = 0;
-    while (token === state.pollToken) {
-      let job;
-      try { job = await api(`/api/jobs/${encodeURIComponent(id)}`); failures = 0; }
-      catch (error) {
-        failures += 1;
-        if (failures >= 4 || error.status === 404) throw error;
-        $('#progress-message').textContent = '连接暂时中断，正在重新获取进度…';
-        await delay(1500 * failures);
-        continue;
-      }
-      if (token !== state.pollToken) return;
-      state.job = job;
-      state.activeJobId = job.id || id;
-      state.summaryPending = false;
-      renderJob(job);
-      if (terminalStates.has(job.state) && job.ai_summary?.state !== 'running') {
-        state.stopRequested = false;
-        setBusy(false);
-        toggle($('#progress-panel'), false);
-        if (job.state === 'error') notice('#search-notice', job.error || job.message || '搜索未能完成，请检查服务配置后重试。');
-        loadHistory();
-        return;
-      }
-      await delay(900);
-    }
+  function startTaskPolling(entry, restart = false) {
+    if (entry.polling && !restart) return;
+    const generation = ++entry.generation; const epoch = taskEpoch; entry.polling = true;
+    const valid = () => epoch === taskEpoch && entry.generation === generation && tasks.get(entry.id) === entry;
+    (async () => {
+      let failures = 0;
+      try {
+        while (valid()) {
+          let job;
+          try { job = await api(`/api/jobs/${encodeURIComponent(entry.id)}`); failures = 0; }
+          catch (error) { if (!valid()) return; if (++failures >= 4 || error.status === 404 || error.status === 401) throw error; await delay(1000 * failures); continue; }
+          if (!valid()) return;
+          const firstFull = !entry.full;
+          acceptTask(job); entry.summaryError = '';
+          if (firstFull && state.activeJobId === entry.id && entry.restoreVersion === composerVersion) restoreTaskForm(job);
+          if (!taskActive(entry)) entry.stopRequested = false;
+          displayTask(entry); renderTasks(); updateModelModes();
+          if (terminalStates.has(job.state) && !taskActive(entry)) { loadHistory(); return; }
+          await delay(900);
+        }
+      } catch (error) {
+        if (!valid()) return;
+        entry.error = error.message;
+        if (entry.job.ai_summary?.state === 'running') entry.summaryError = error.message;
+        displayTask(entry); renderTasks();
+      } finally { if (valid()) entry.polling = false; }
+    })();
   }
 
   function showProgress(job) {
@@ -687,7 +813,8 @@
     stop.textContent = state.stopRequested ? '停止中…' : state.busyMode === 'summary' ? '停止总结' : '停止搜索';
     const resumable = job && resumableStates.has(job.state) && !state.busy;
     toggle($('#job-status-panel'), Boolean(resumable));
-    $('#continue-search').disabled = state.busy;
+    $('#continue-search').disabled = state.busy || !hasTaskCapacity();
+    $('#continue-search').title = !hasTaskCapacity() ? `最多同时运行 ${taskLimit()} 个任务，请先等待或停止其他任务。` : '只继续当前选中的任务';
     if (resumable) {
       $('#job-status-panel').dataset.state = job.state;
       const titles = { awaiting_user: '搜索已暂停，等待你决定下一步', stopped: '已停止搜索，现有线索已保留', done: '本次搜索已完成，还可以继续深挖' };
@@ -700,50 +827,38 @@
   }
 
   async function stopSearch() {
-    const id = state.activeJobId || state.job?.id;
-    if (!id || state.stopRequested || (!state.busy && !['queued', 'running'].includes(state.job?.state) && state.job?.ai_summary?.state !== 'running')) return;
-    const resumePolling = !state.busy;
-    const token = resumePolling ? ++state.pollToken : state.pollToken;
-    state.stopRequested = true;
-    if (resumePolling) setBusy(true, state.job?.ai_summary?.state === 'running' ? 'summary' : 'search');
-    renderJobControls();
-    if (state.job && ['running', 'queued'].includes(state.job.state)) showProgress(state.job);
+    const entry = currentTask();
+    if (!entry || entry.stopRequested || !taskActive(entry)) return;
+    const epoch = taskEpoch; entry.stopRequested = true; entry.stopPending = true; displayTask(entry); renderTasks();
     try {
-      await api(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: 'POST', body: {} });
-      if (token !== state.pollToken) return;
-      if (state.busy) toast('已请求停止。已发出的外部请求可能仍会完成，后续检索将停止。');
-      if (resumePolling) await pollJob(id, token);
+      await api(`/api/jobs/${encodeURIComponent(entry.id)}/stop`, { method: 'POST', body: {} });
+      if (epoch !== taskEpoch) return;
+      entry.stopPending = false;
+      if (state.activeJobId === entry.id) toast('已请求停止当前任务。其他任务继续运行。');
+      startTaskPolling(entry, true);
     } catch (error) {
-      if (token !== state.pollToken) return;
-      state.stopRequested = false;
-      if (resumePolling) setBusy(false);
-      renderJobControls();
-      notice('#search-notice', error.message);
+      if (epoch !== taskEpoch) return;
+      entry.stopRequested = false; entry.stopPending = false; entry.error = error.message; displayTask(entry); renderTasks(); loadTasks();
     }
   }
 
   async function continueSearch() {
-    const job = state.job;
-    if (!job || state.busy || !resumableStates.has(job.state)) return;
-    const token = ++state.pollToken;
-    const id = job.id;
-    state.activeJobId = id;
-    state.stopRequested = false;
-    state.summaryError = '';
-    state.summaryPending = false;
-    notice('#search-notice', '');
-    setBusy(true);
-    showProgress({ stage: 'adapting', progress: 0, round: job.round, searches_count: job.searches_count, message: '正在保留已有线索并准备继续搜索…' });
+    const entry = currentTask();
+    if (!entry || taskActive(entry) || !resumableStates.has(entry.job.state)) return;
+    if (!hasTaskCapacity()) { notice('#search-notice', `已有 ${taskLimit()} 个任务运行，请等待或停止其中一个后继续。`); loadTasks(); return; }
+    const epoch = taskEpoch; const body = { max_rounds: roundBudget(), depth: searchDepth() };
+    entry.operation = 'continue'; entry.stopRequested = false; entry.error = ''; entry.summaryError = '';
+    displayTask(entry); renderTasks();
     try {
-      const response = await api(`/api/jobs/${encodeURIComponent(id)}/continue`, { method: 'POST', body: { max_rounds: roundBudget(), depth: searchDepth() } });
-      if (token !== state.pollToken) return;
-      if (state.stopRequested) await api(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: 'POST', body: {} });
-      await pollJob(response.job_id || id, token);
+      await api(`/api/jobs/${encodeURIComponent(entry.id)}/continue`, { method: 'POST', body });
+      if (epoch !== taskEpoch) return;
+      entry.operation = ''; entry.job = { ...entry.job, state: 'queued', stage: 'adapting', depth: body.depth, max_rounds: body.max_rounds };
+      if (entry.stopRequested) await api(`/api/jobs/${encodeURIComponent(entry.id)}/stop`, { method: 'POST', body: {} });
+      if (epoch !== taskEpoch) return;
+      displayTask(entry); startTaskPolling(entry, true);
     } catch (error) {
-      if (token !== state.pollToken) return;
-      setBusy(false);
-      toggle($('#progress-panel'), false);
-      notice('#search-notice', error.message);
+      if (epoch !== taskEpoch) return;
+      entry.operation = ''; entry.error = error.message; displayTask(entry); renderTasks(); loadTasks();
     }
   }
 
@@ -999,7 +1114,7 @@
     const status = state.summaryPending ? 'running' : state.summaryError ? 'error' : summary.state || 'missing';
     const canResumePolling = Boolean(state.summaryError && summary.state === 'running' && job.state !== 'error');
     const button = $('#generate-summary');
-    button.disabled = state.busy || status === 'running' || !hasResults || (!canGenerate && !canResumePolling);
+    button.disabled = (!canResumePolling && (state.busy || status === 'running' || !hasTaskCapacity())) || !hasResults || (!canGenerate && !canResumePolling);
     button.textContent = status === 'running' ? '正在总结…' : state.summaryError || status === 'error' ? '重试 AI 总结 ↗' : status === 'ready' ? '重新总结 ↗' : '生成 AI 总结 ↗';
     button.title = job.state === 'error' ? '搜索尚未成功完成，请重新搜索后生成 AI 总结' : !hasResults ? '获取搜索结果后即可生成总结' : !canGenerate && !canResumePolling ? '搜索成功完成后才能生成 AI 总结，请先重新完成搜索' : '将本次搜索中相关的已获取内容发送至配置的 AI 服务，生成附有来源的总结';
     card.setAttribute('aria-busy', String(status === 'running'));
@@ -1080,29 +1195,24 @@
   }
 
   async function generateSummary() {
-    const job = state.job;
-    if (!job || state.busy || job.state === 'error' || !Array.isArray(job.results) || !job.results.length) return;
-    const jobId = job.id;
-    const resumePolling = Boolean(state.summaryError && job.ai_summary?.state === 'running');
-    if (!resumableStates.has(job.state) && !resumePolling) return;
-    const token = ++state.pollToken;
-    state.summaryPending = true;
-    state.summaryError = '';
-    state.stopRequested = false;
-    state.activeJobId = jobId;
-    setBusy(true, 'summary');
+    const entry = currentTask(); const job = entry?.job;
+    const resumePolling = Boolean(entry?.summaryError && job?.ai_summary?.state === 'running');
+    if (!job || (taskActive(entry) && !resumePolling) || !resumableStates.has(job.state) || !Array.isArray(job.results) || !job.results.length) return;
+    if (resumePolling) { entry.error = ''; entry.summaryError = ''; startTaskPolling(entry, true); displayTask(entry); return; }
+    if (!hasTaskCapacity()) { notice('#search-notice', `已有 ${taskLimit()} 个任务运行，请等待或停止其中一个后生成总结。`); loadTasks(); return; }
+    const epoch = taskEpoch;
+    entry.operation = 'summary'; entry.summaryError = ''; entry.error = ''; entry.stopRequested = false;
+    displayTask(entry); renderTasks();
     try {
-      if (resumePolling) { await pollJob(jobId, token); return; }
-      const response = await api(`/api/jobs/${encodeURIComponent(jobId)}/summarize`, { method: 'POST', body: {} });
-      if (token !== state.pollToken || state.job?.id !== jobId) return;
-      if (state.stopRequested) await api(`/api/jobs/${encodeURIComponent(jobId)}/stop`, { method: 'POST', body: {} });
-      await pollJob(response.job_id || jobId, token);
+      await api(`/api/jobs/${encodeURIComponent(entry.id)}/summarize`, { method: 'POST', body: {} });
+      if (epoch !== taskEpoch) return;
+      entry.operation = ''; entry.job.ai_summary = { ...(entry.job.ai_summary || {}), state: 'running' };
+      if (entry.stopRequested) await api(`/api/jobs/${encodeURIComponent(entry.id)}/stop`, { method: 'POST', body: {} });
+      if (epoch !== taskEpoch) return;
+      displayTask(entry); startTaskPolling(entry, true);
     } catch (error) {
-      if (token !== state.pollToken || state.job?.id !== jobId) return;
-      state.summaryPending = false;
-      state.summaryError = error.message;
-      setBusy(false);
-      renderAISummary(state.job);
+      if (epoch !== taskEpoch) return;
+      entry.operation = ''; entry.summaryError = error.message; displayTask(entry); renderTasks(); loadTasks();
     }
   }
 
@@ -1335,39 +1445,9 @@
   }
 
   async function openHistory(id) {
-    if (state.busy) { toast(state.busyMode === 'summary' ? 'AI 总结正在生成，完成后即可打开其他记录。' : '当前搜索仍在运行，请完成后再打开历史记录。'); return; }
-    const token = ++state.pollToken;
-    try {
-      const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
-      if (token !== state.pollToken) return;
-      state.job = job;
-      state.activeJobId = job.id || id;
-      state.stopRequested = false;
-      state.lastResults = '';
-      state.lastAISummary = '';
-      state.lastRounds = '';
-      resetProgressReport();
-      state.summaryPending = false;
-      state.summaryError = '';
-      state.filter = 'all';
-      state.views = 'all';
-      $('#views-filter').value = 'all';
-      $$('[data-filter]').forEach(button => { button.classList.toggle('active', button.dataset.filter === 'all'); button.setAttribute('aria-pressed', String(button.dataset.filter === 'all')); });
-      const historyItem = state.history.find(item => item.id === id);
-      $('#query').value = job.query || (historyItem && historyItem.query) || '';
-      if (typeof job.use_ai === 'boolean') $('#use-ai').checked = job.use_ai;
-      if (typeof job.adaptive === 'boolean') $('#adaptive-search').checked = job.adaptive;
-      if ([0, 3, 6, 12].includes(job.max_rounds)) $('#max-rounds').value = String(job.max_rounds);
-      $('#search-depth').value = ['quick','deep','research'].includes(job.depth) ? job.depth : 'deep';
-      updateDepthDescription();
-      if (typeof job.fetch_pages === 'boolean') $('#fetch-pages').checked = job.fetch_pages;
-      if (Array.isArray(job.platforms)) {state.selectedPlatforms=new Set(job.platforms);state.platformSelectionEdited=true;syncPlatformSelection();}
-      if (Array.isArray(job.custom_sites)) { renderSiteRows(job.custom_sites); state.sitesDirty = true; }
-      notice('#search-notice', job.state === 'error' ? job.error || job.message || '这次搜索未能完成。' : '');
-      showView('search');
-      renderJob(job);
-      if (job.state === 'running' || job.state === 'queued' || job.ai_summary?.state === 'running') { setBusy(true, job.ai_summary?.state === 'running' ? 'summary' : 'search'); await pollJob(id, token); }
-    } catch (error) { if (token !== state.pollToken) return; if (state.job?.ai_summary?.state === 'running') state.summaryError = error.message; setBusy(false); notice('#search-notice', error.message); toast(error.message); }
+    if (!ensureBackend()) return;
+    const item = state.history.find(value => value.id === id);
+    selectTask(id, item?.query || '');
   }
 
   async function loadLibrary() {
@@ -1454,6 +1534,8 @@
   });
   $('#test-ai').addEventListener('click', () => saveSettings(true));
   $('#search-form').addEventListener('submit', startSearch);
+  ['input','change'].forEach(event => $('#search-form').addEventListener(event, () => { composerVersion += 1; }));
+  $('#new-search').addEventListener('click', newSearch);
   $('#query').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); startSearch(); } });
   $('.platform-options').addEventListener('click', event => {const button=event.target.closest('.platform-chip');if(button && $('.platform-options').contains(button))selectPlatform(button);});
   $('#search-depth').addEventListener('change', updateDepthDescription);
@@ -1497,4 +1579,5 @@
   updateDepthDescription();
   connection.catalog().then(data => { offlinePlatforms = Array.isArray(data.items) ? data.items : []; renderOfflineLinks(); });
   connection.initialize().then(() => { initialized = true; refreshBackendData(); });
+  setInterval(() => { if (connection.snapshot().connected) loadTasks(); }, 6000);
 })();

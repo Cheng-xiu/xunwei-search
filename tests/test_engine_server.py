@@ -106,6 +106,22 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn('synthetic-', json.dumps(catalog))
         self.assertTrue(next(item for item in catalog if item['id'] == 'tavily')['configured'])
 
+    def test_concurrent_jobs_and_limits_are_exposed_over_http(self):
+        health = self.request('/api/health')
+        self.assertIn('concurrent_search', health['features'])
+        self.assertEqual(health['search_limits'], {'max_active_jobs': 4, 'max_search_concurrency': 12})
+        self.request('/api/config', {'search_concurrency': 8}, method='PUT')
+        with patch.object(self.app, '_run', return_value=None):
+            first = self.request('/api/search', {'query': '第一个并行问题', 'use_ai': False})['job_id']
+            second = self.request('/api/search', {'query': '第二个并行问题', 'use_ai': False})['job_id']
+        listing = self.request('/api/jobs')
+        self.assertEqual(listing['active_jobs'], 2)
+        self.assertEqual({item['id'] for item in listing['items']}, {first, second})
+        self.assertTrue(all(item['search_concurrency'] == 8 for item in listing['items']))
+        self.request('/api/jobs/' + first + '/stop', {}, method='POST')
+        self.assertEqual(self.request('/api/jobs/' + second)['state'], 'queued')
+        self.assertEqual(self.request('/api/jobs')['active_jobs'], 1)
+
     def test_secret_never_returned_and_blank_save_preserves(self):
         masked = self.request('/api/config', {'api_key': 'test-private-value'}, 'PUT')
         self.assertTrue(masked['has_api_key'])

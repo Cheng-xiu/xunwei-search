@@ -121,6 +121,38 @@ test('Local default retains same-origin API paths after health and catalog verif
   assert(calls.every(call => !call.options.headers.Authorization));
 });
 
+test('Concurrent-search capabilities and limits are read from health and cleared for legacy connections', async () => {
+  const { connection } = setup({ handler: url => url.endsWith('/api/health') ? json(url.startsWith('https://modern.example') ? { ok: true, features: { concurrent_search: true, disabled_feature: false }, search_limits: { max_active_jobs: 4, max_search_concurrency: 12 } } : { ok: true }) : json(platforms) });
+  await connection.connect('https://modern.example');
+  assert.deepEqual(Array.from(connection.snapshot().features), ['concurrent_search']);
+  assert.equal(connection.snapshot().searchLimits.max_active_jobs, 4);
+  const snapshot = connection.snapshot(); snapshot.features.push('modified'); snapshot.searchLimits.max_active_jobs = 99;
+  assert.equal(connection.snapshot().features.length, 1);
+  assert.equal(connection.snapshot().searchLimits.max_active_jobs, 4);
+  await connection.connect('https://legacy.example');
+  assert.equal(connection.snapshot().features.length, 0);
+  assert.equal(Object.keys(connection.snapshot().searchLimits).length, 0);
+});
+
+test('Disconnected task discovery stays offline and concurrent task reads all abort on backend switch', async () => {
+  const pending = [];
+  const { connection, calls } = setup({ handler: url => {
+    if (url.endsWith('/api/health')) return json({ ok: true, features: ['concurrent_search'] });
+    if (url.endsWith('/api/platforms')) return json(platforms);
+    return new Promise(resolve => pending.push(resolve));
+  } });
+  assert.equal((await connection.request('/api/jobs')).items.length, 0);
+  assert.equal(calls.length, 0);
+  await connection.connect('https://first.example');
+  const reads = [connection.request('/api/jobs/a'), connection.request('/api/jobs/b')];
+  const jobCalls = calls.slice(-2);
+  await connection.connect('https://second.example');
+  assert(jobCalls.every(call => call.options.signal.aborted));
+  pending.forEach(resolve => resolve(json({ state: 'running' })));
+  for (const read of reads) await assert.rejects(read, { code: 'BACKEND_CHANGED' });
+  assert(!calls.some(call => call.url.startsWith('https://second.example/api/jobs/')));
+});
+
 test('Remote prefix and Bearer token are applied only after explicit configuration', async () => {
   const { connection, calls, store } = setup();
   await connection.connect('https://backend.example/prefix/', 'test-access-token');
