@@ -4,6 +4,31 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const connection = window.XunweiConnection;
+  const ownerAI = (() => {
+    const value = window.XUNWEI_DEPLOYMENT?.ownerAI;
+    if (!value || typeof value.baseURL !== 'string' || typeof value.model !== 'string' || typeof value.apiKey !== 'string') return null;
+    try {
+      const url = new URL(value.baseURL);
+      if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !value.model.trim() || !value.apiKey.trim()) return null;
+      return Object.freeze({ base_url: url.href.replace(/\/+$/, ''), model: value.model.trim(), api_key: value.apiKey.trim() });
+    } catch (_) { return null; }
+  })();
+  let ownerChoice = 'shared';
+  let ownerAppliedRevision = -1;
+  let ownerCheckedRevision = -1;
+  let ownerNeedsPersonalKey = false;
+  let ownerApplyOnConnect = false;
+  let modelOperation = 0;
+  function ownerChoiceKey() { return `xunwei.model-choice.v1:${new URL('./', document.baseURI).pathname}:${connection.snapshot().apiBase}`; }
+  function savedOwnerChoice() { try { return sessionStorage.getItem(ownerChoiceKey()) || ''; } catch (_) { return ''; } }
+  function rememberOwnerChoice(value) { if (ownerAI) try { sessionStorage.setItem(ownerChoiceKey(), value); } catch (_) { /* Only a non-secret choice is retained. */ } }
+  function beginModelOperation() { modelModeBusy = true; const token = ++modelOperation; updateModelModes(); updateSubmitButton(); return token; }
+  function endModelOperation(token) { if (token === modelOperation) { modelModeBusy = false; updateConnection(); } }
+  function presetConfigurationPending() {
+    if (!ownerAI) return false;
+    const backend = connection.snapshot();
+    return ownerChoice === 'shared' ? ownerAppliedRevision !== backend.revision : ownerNeedsPersonalKey || backend.visitorSession && backend.sessionMode !== 'custom';
+  }
   const platformNames = { bilibili: 'B 站', xiaohongshu: '小红书', zhihu: '知乎', wechat: '微信公众号', meituan: '美团', dianping: '大众点评', douyin: '抖音', tieba: '贴吧', douban: '豆瓣', github: 'GitHub', stackoverflow: 'Stack Overflow', v2ex: 'V2EX', csdn: 'CSDN', cnblogs: '博客园', reddit: 'Reddit', web: '公开网页', local: '本地资料' };
   const platformIcons = { bilibili: ['bili', 'B'], xiaohongshu: ['red', '小'], zhihu: ['blue', '知'], wechat: ['green', '微'], meituan: ['gold', '美'], dianping: ['orange', '评'], douyin: ['gray', '抖'], tieba: ['blue', '贴'], douban: ['green', '豆'], github: ['gray', 'G'], stackoverflow: ['orange', 'S'], v2ex: ['gray', 'V'], csdn: ['orange', 'C'], cnblogs: ['blue', '博'], reddit: ['red', 'R'], web: ['gray', '◎'], local: ['gray', '▤'] };
   const stageNames = { queued: '等待搜索', planning: '正在拆解问题', searching: '正在跨平台检索', fetching: '正在读取原文', reading: '正在读取原文', ranking: '正在核对匹配与证据', analyzing: 'AI 正在核对证据', evaluating: 'AI 正在核对证据', reporting: 'AI 正在汇报本轮进展', adapting: 'AI 正在调整下一轮搜索方向', waiting: '等待继续搜索', stopped: '搜索已停止', summarizing: 'AI 正在整理有据可查的总结', done: '搜索完成', error: '搜索未完成' };
@@ -113,7 +138,7 @@
     const local = localBackend();
     const configured = backend.connected && Boolean(state.config?.has_api_key);
     $('#connection-pill').classList.toggle('connected', configured);
-    $('#connection-pill span').textContent = !backend.connected ? '未连接' : backend.visitorSession && (state.config?.api_mode || backend.sessionMode) === 'shared' ? '站主 API' : configured ? 'AI 已配置' : '配置 AI';
+    $('#connection-pill span').textContent = !backend.connected ? '未连接' : ownerAI && ownerAppliedRevision === backend.revision ? '站主 API' : backend.visitorSession && (state.config?.api_mode || backend.sessionMode) === 'shared' ? '站主 API' : configured ? 'AI 已配置' : '配置 AI';
     $('#connection-pill').title = !backend.connected ? '先连接搜索服务，再配置模型。' : configured ? `当前模型：${state.config.model || '未设置'}。点击查看设置。` : '点击配置 AI 服务';
     $('#open-backend').textContent = backend.connected ? '服务已连接' : '连接服务';
     $('#open-backend').title = backend.connected ? backend.apiBase || location.origin : '连接你自己的寻微搜索服务';
@@ -127,7 +152,7 @@
     if (!$('#library-view').classList.contains('hidden')) $('#breadcrumb-current').textContent = local ? '本地资料库' : '资料库';
     platformNames.local = local ? '本地资料' : '导入资料';
     toggle($('#backend-banner'), !backend.connected);
-    $('#backend-banner-copy').textContent = backend.mode === 'pages' ? '这是 GitHub Pages 静态界面。站主 API 与自配 API 都需要连接搜索服务；当前无法确认站主是否提供额度。可先手动打开平台搜索。' : '搜索服务尚未连接。请确认本机程序已启动，或填写你自己的服务地址；也可以先手动打开平台搜索入口。';
+    $('#backend-banner-copy').textContent = ownerAI && backend.mode === 'pages' ? '站主模型配置已提供，选择“使用站主 API”可查看自动填写的设置。智能搜索仍需连接搜索服务；当前只能手动打开搜索入口。' : backend.mode === 'pages' ? '这是 GitHub Pages 静态界面。站主 API 与自配 API 都需要连接搜索服务；当前无法确认站主是否提供额度。可先手动打开平台搜索。' : '搜索服务尚未连接。请确认本机程序已启动，或填写你自己的服务地址；也可以先手动打开平台搜索入口。';
     if (!state.busy) $('#search-button span').textContent = backend.connected ? '开始搜索' : '连接后搜索';
     renderOfflineLinks();
     updateModelModes();
@@ -138,36 +163,41 @@
 
   function updateModelModes() {
     const backend = connection.snapshot();
-    const mode = state.config?.api_mode || backend.sessionMode || 'custom';
-    const available = backend.connected && backend.visitorSession && (state.config?.shared_available ?? backend.sharedAvailable);
-    toggle($('#model-mode-panel'), backend.mode === 'pages' || backend.publicMode);
+    const mode = ownerAI ? ownerChoice : state.config?.api_mode || backend.sessionMode || 'custom';
+    const available = Boolean(ownerAI) || backend.connected && backend.visitorSession && (state.config?.shared_available ?? backend.sharedAvailable);
+    toggle($('#model-mode-panel'), Boolean(ownerAI) || backend.mode === 'pages' || backend.publicMode);
     $$('[data-model-mode]').forEach(button => {
-      const selected = backend.connected && button.dataset.modelMode === mode;
+      const selected = (Boolean(ownerAI) || backend.connected) && button.dataset.modelMode === mode;
       button.classList.toggle('selected', selected);
       button.setAttribute('aria-pressed', String(selected));
       button.disabled = anyTaskActive() || modelModeBusy || (backend.connected && button.dataset.modelMode === 'shared' && !available);
       button.title = backend.connected && button.dataset.modelMode === 'shared' && !available ? '该服务尚未向此连接开放站主 API。' : '';
     });
-    $('#shared-mode-description').textContent = !backend.connected ? '需要连接服务；尚未确认站主是否开放' : available ? '站主已开放，无需填写模型密钥' : '此服务尚未开放站主 API';
-    $('#custom-mode-description').textContent = !backend.connected ? '连接服务后，填写自己的模型与密钥' : backend.visitorSession ? mode === 'custom' && state.config?.has_api_key ? '当前会话已配置个人模型' : '密钥与设置只属于你的访客会话' : '使用当前服务上的个人 API 配置';
+    $('#shared-mode-description').textContent = ownerAI ? ownerAppliedRevision === backend.revision && backend.connected ? '站主预置已保存至当前搜索服务' : '自动填入站主公开提供的模型配置' : !backend.connected ? '需要连接服务；尚未确认站主是否开放' : available ? '站主已开放，无需填写模型密钥' : '此服务尚未开放站主 API';
+    $('#custom-mode-description').textContent = ownerAI && mode === 'custom' && backend.visitorSession && backend.sessionMode === 'shared' ? '当前仍为服务端站主模式，点击切换' : !backend.connected ? '连接服务后，填写自己的模型与密钥' : backend.visitorSession ? mode === 'custom' && state.config?.has_api_key && !ownerNeedsPersonalKey ? '当前会话已配置个人模型' : '密钥与设置只属于你的访客会话' : '使用当前服务上的个人 API 配置';
     $('#visitor-session-status').textContent = backend.connected && backend.visitorSession ? `独立访客会话${backend.expiresAt ? ` · 至 ${formatDate(backend.expiresAt)}` : ''}` : '';
-    $('#model-mode-note').textContent = !backend.connected ? '两种方式均需要连接搜索服务。静态页面本身不提供 AI 额度。' : backend.visitorSession ? '你的历史、资料与 API 配置按访客会话隔离。API 密钥由连接的服务代为调用，请使用你信任的服务。' : '当前是私人服务连接；只有提供独立访客会话的公开服务才可选择站主 API。';
-    toggle($('#settings-model-control'), backend.visitorSession);
+    $('#model-mode-note').textContent = ownerAI ? !backend.connected ? '站主预置可先查看；两种方式都需要连接搜索服务后才能智能搜索。' : ownerNeedsPersonalKey ? '服务仍保留上次站主配置。填写并保存个人密钥后才会改用个人 API；旧个人密钥无法从服务读回。' : ownerAppliedRevision === backend.revision ? '已应用站主预置。切换个人 API 后请填写自己的密钥；不会自动恢复之前的密钥。' : '当前服务已有的模型配置会保留；明确点击“使用站主 API”或保存站主设置才会替换。' : !backend.connected ? '两种方式均需要连接搜索服务。静态页面本身不提供 AI 额度。' : backend.visitorSession ? '你的历史、资料与 API 配置按访客会话隔离。API 密钥由连接的服务代为调用，请使用你信任的服务。' : '当前是私人服务连接；只有提供独立访客会话的公开服务才可选择站主 API。';
+    toggle($('#settings-model-control'), Boolean(ownerAI) || backend.visitorSession);
     $('#settings-model-mode').value = mode;
     $('#settings-model-mode').disabled = anyTaskActive() || modelModeBusy;
     $('#settings-model-mode option[value="shared"]').disabled = !available;
-    const readonly = state.config?.ai_config_readonly === true || (backend.visitorSession && mode === 'shared');
-    toggle($('#custom-ai-settings'), !readonly);
-    $$('#custom-ai-settings input').forEach(input => { input.disabled = readonly; });
-    toggle($('#clear-api').closest('label'), !readonly);
-    $('#clear-api').disabled = readonly;
+    const readonly = state.config?.ai_config_readonly === true || (backend.visitorSession && backend.sessionMode === 'shared');
+    const presetSelected = Boolean(ownerAI) && mode === 'shared';
+    toggle($('#custom-ai-settings'), !readonly || presetSelected);
+    $$('#custom-ai-settings input').forEach(input => { input.disabled = readonly && !presetSelected; input.readOnly = presetSelected; });
+    toggle($('#clear-api').closest('label'), !readonly && !presetSelected);
+    $('#clear-api').disabled = readonly || presetSelected;
     toggle($('#test-ai'), !readonly);
-    toggle($('#shared-model-info'), readonly);
-    $('#shared-model-info').textContent = readonly ? `当前使用站主提供的模型${state.config?.model ? `：${state.config.model}` : ''}。站主密钥不会显示或提供修改入口；切换到“自己配置 API”可使用个人模型。` : '';
+    $('#test-ai').disabled = modelModeBusy || Boolean(ownerAI && !backend.connected);
+    $('#save-settings').disabled = modelModeBusy || Boolean(ownerAI && anyTaskActive());
+    $('#save-settings').textContent = ownerAI && !backend.connected ? '连接后保存' : '保存设置';
+    toggle($('#shared-model-info'), readonly || presetSelected || ownerNeedsPersonalKey);
+    $('#shared-model-info').textContent = presetSelected ? !backend.connected ? '已自动填入站主公开预置；尚未连接搜索服务，也未保存或测试。' : ownerAppliedRevision === backend.revision ? '已将站主预置保存到当前服务。公开访客使用自己的隔离配置，不修改服务器的站主设置。' : '已填入站主预置。当前服务已有配置时，保存会替换其 AI 地址、模型与密钥。' : ownerNeedsPersonalKey ? '已清空表单中的站主密钥。请输入并保存自己的密钥后再搜索；留空不会自动恢复旧个人密钥。' : readonly ? `当前使用站主提供的模型${state.config?.model ? `：${state.config.model}` : ''}。站主密钥不会显示或提供修改入口；切换到“自己配置 API”可使用个人模型。` : '';
   }
 
   async function changeModelMode(mode, showSettings = false) {
     if (!['shared','custom'].includes(mode) || modelModeBusy || anyTaskActive()) return;
+    if (ownerAI) { await changePresetMode(mode, showSettings); return; }
     const backend = connection.snapshot();
     if (!backend.connected) { requestedModelMode = mode; openBackend(); return; }
     if (!backend.visitorSession) { if (mode === 'custom') openSettings(); return; }
@@ -185,6 +215,53 @@
     } catch (error) {
       if (error.code !== 'BACKEND_CHANGED') { notice('#model-mode-feedback', error.message); if ($('#settings-dialog').open) notice('#settings-feedback', error.message); }
     } finally { modelModeBusy = false; updateModelModes(); }
+  }
+
+  async function applyOwnerPreset(explicit = false) {
+    const backend = connection.snapshot();
+    if (!ownerAI || ownerChoice !== 'shared' || !backend.connected || modelModeBusy || anyTaskActive()) return false;
+    if (!explicit && state.config?.has_api_key !== false) return false;
+    const revision = backend.revision;
+    const operation = beginModelOperation();
+    try {
+      if (backend.visitorSession && backend.sessionMode !== 'custom') await connection.setModelMode('custom');
+      if (connection.snapshot().revision !== revision || !connection.snapshot().connected) return false;
+      if (anyTaskActive()) throw new Error('当前有搜索或总结任务，请结束后再应用站主配置。');
+      const config = await api('/api/config', { method: 'PUT', body: { ...ownerAI } });
+      if (connection.snapshot().revision !== revision) return false;
+      state.config = config; ownerAppliedRevision = revision; ownerNeedsPersonalKey = false;
+      rememberOwnerChoice('shared');
+      notice('#model-mode-feedback', '站主预置已保存至当前搜索服务；尚未发起 AI 调用。', true);
+      return true;
+    } catch (error) {
+      if (connection.snapshot().revision === revision && error.code !== 'BACKEND_CHANGED') { notice('#model-mode-feedback', error.message); notice('#settings-feedback', error.message); }
+      return false;
+    } finally { endModelOperation(operation); }
+  }
+
+  async function changePresetMode(mode, showSettings) {
+    const backend = connection.snapshot();
+    const revision = backend.revision;
+    const previousChoice = ownerChoice;
+    ownerChoice = mode;
+    if (mode === 'shared') {
+      if (backend.connected) await applyOwnerPreset(true);
+      else rememberOwnerChoice('shared');
+    } else {
+      ownerApplyOnConnect = false;
+      ownerNeedsPersonalKey ||= backend.connected && ownerAppliedRevision === revision;
+      if (backend.connected && backend.visitorSession && backend.sessionMode !== 'custom') {
+        const operation = beginModelOperation();
+        try { await connection.setModelMode('custom'); state.config = await api('/api/config'); }
+        catch (error) { if (connection.snapshot().revision === revision) { ownerChoice = previousChoice; if (error.code !== 'BACKEND_CHANGED') notice('#model-mode-feedback', error.message); } return; }
+        finally { endModelOperation(operation); }
+      }
+      rememberOwnerChoice(ownerNeedsPersonalKey ? 'custom_pending' : 'custom');
+    }
+    if (connection.snapshot().revision !== revision) return;
+    updateConnection();
+    if ($('#settings-dialog').open) fillSettings(state.config || {});
+    else if (showSettings) await openSettings();
   }
 
   function openBackend() {
@@ -209,7 +286,7 @@
     $('#save-backend').disabled = true;
     notice('#backend-feedback', '正在验证健康状态、访问权限与平台目录…');
     try {
-      await connection.connect($('#backend-url').value, $('#clear-backend-token').checked ? '' : $('#backend-token').value, !$('#clear-backend-token').checked, { mode: requestedModelMode });
+      await connection.connect($('#backend-url').value, $('#clear-backend-token').checked ? '' : $('#backend-token').value, !$('#clear-backend-token').checked, { mode: ownerAI ? 'custom' : requestedModelMode });
       requestedModelMode = undefined;
       $('#backend-token').value = '';
       $('#backend-dialog').close();
@@ -219,6 +296,8 @@
   }
 
   function resetBackendView() {
+    modelOperation += 1; modelModeBusy = false;
+    ownerAppliedRevision = -1; ownerNeedsPersonalKey = false;
     taskEpoch += 1;
     tasks.forEach(entry => { entry.generation += 1; });
     tasks.clear();
@@ -258,7 +337,22 @@
   }
 
   async function refreshBackendData() {
+    const revision = connection.snapshot().revision;
     await Promise.allSettled([loadConfig(), loadHistory(), loadLibrary(), loadPlatforms(), loadSearchEngines(), loadTasks()]);
+    if (revision !== connection.snapshot().revision) return;
+    if (ownerAI && connection.snapshot().connected && ownerCheckedRevision !== revision) {
+      ownerCheckedRevision = revision;
+      let explicit = ownerApplyOnConnect; ownerApplyOnConnect = false;
+      const saved = savedOwnerChoice();
+      if (!explicit) {
+        if (saved === 'custom' || saved === 'custom_pending') ownerChoice = 'custom';
+        ownerNeedsPersonalKey = saved === 'custom_pending';
+        if (saved === 'shared') { ownerChoice = 'shared'; explicit = true; }
+        else if (state.config?.has_api_key && connection.snapshot().sessionMode !== 'shared') { ownerChoice = 'custom'; rememberOwnerChoice(ownerNeedsPersonalKey ? 'custom_pending' : 'custom'); }
+        else if (ownerChoice === 'shared' && connection.snapshot().visitorSession && connection.snapshot().sessionMode === 'shared') explicit = true;
+      }
+      await applyOwnerPreset(explicit);
+    }
     updateConnection();
   }
 
@@ -493,6 +587,10 @@
   function roundBudget() { const value = Number($('#max-rounds').value); return [0, 3, 6, 12].includes(value) ? value : 3; }
 
   async function openSettings() {
+    if (modelModeBusy) return;
+    if (ownerAI && !connection.snapshot().connected) {
+      fillSettings(state.config || {}); notice('#settings-feedback', '当前只预览模型配置。连接搜索服务后才能保存、测试或搜索。'); $('#settings-dialog').showModal(); return;
+    }
     if (!ensureBackend()) return;
     notice('#settings-feedback', '');
     try { state.config = await api('/api/config'); updateConnection(); }
@@ -507,6 +605,9 @@
     $('#model').value = config.model || '';
     $('#searxng-url').value = config.searxng_url || '';
     ['api-key', 'tavily-key', 'brave-key'].forEach(id => { $(`#${id}`).value = ''; });
+    if (ownerAI && ownerChoice === 'shared') {
+      $('#base-url').value = ownerAI.base_url; $('#model').value = ownerAI.model; $('#api-key').value = ownerAI.api_key;
+    }
     ['clear-api', 'clear-tavily', 'clear-brave'].forEach(id => { $(`#${id}`).checked = false; });
     updateSecretLabels(config);
     updateModelModes();
@@ -515,13 +616,14 @@
   }
 
   function updateSecretLabels(config) {
-    $('#ai-key-state').textContent = config.has_api_key ? '已保存 · 留空不修改' : '尚未设置';
+    $('#ai-key-state').textContent = ownerAI && ownerChoice === 'shared' ? '站主公开预置 · 已填入' : ownerNeedsPersonalKey ? '需要填写个人密钥' : config.has_api_key ? '已保存 · 留空不修改' : '尚未设置';
     $('#tavily-key-state').textContent = config.has_tavily_key ? '已保存 · 留空不修改' : '尚未设置';
     $('#brave-key-state').textContent = config.has_brave_key ? '已保存 · 留空不修改' : '尚未设置';
   }
 
   function settingsPayload() {
-    const readonly = state.config?.ai_config_readonly === true || (connection.snapshot().visitorSession && (state.config?.api_mode || connection.snapshot().sessionMode) === 'shared');
+    const readonly = ownerAI && ownerChoice === 'shared' || state.config?.ai_config_readonly === true || (connection.snapshot().visitorSession && (state.config?.api_mode || connection.snapshot().sessionMode) === 'shared');
+    if (ownerNeedsPersonalKey && !$('#api-key').value.trim() && !$('#clear-api').checked) throw new Error('请输入自己的 API 密钥后保存；留空不会把站主密钥变成个人配置。');
     const payload = { searxng_url: $('#searxng-url').value.trim(), clear_secrets: [] };
     if (supportsConcurrentSearch()) {
       const concurrency = Number($('#search-concurrency').value);
@@ -548,28 +650,42 @@
 
   async function saveSettings(testConnection) {
     if (modelModeBusy) return;
+    if (ownerAI && !connection.snapshot().connected) {
+      ownerApplyOnConnect = ownerChoice === 'shared';
+      $('#settings-dialog').close(); openBackend(); return;
+    }
+    if (ownerAI && anyTaskActive()) { notice('#settings-feedback', '请先结束当前搜索或总结任务，再保存模型设置。'); return; }
     if (!ensureBackend()) return;
     if (!$('#settings-form').reportValidity()) return;
-    $('#save-settings').disabled = true;
-    $('#test-ai').disabled = true;
+    if (ownerAI && ownerChoice === 'shared' && !await applyOwnerPreset(true)) return;
+    const revision = connection.snapshot().revision;
+    const operation = beginModelOperation();
+    const current = () => connection.snapshot().revision === revision && operation === modelOperation;
     notice('#settings-feedback', testConnection ? '正在保存设置并测试 AI 连接…' : '正在保存…');
     try {
-      state.config = await api('/api/config', { method: 'PUT', body: settingsPayload() });
+      if (ownerAI && ownerChoice === 'custom' && connection.snapshot().visitorSession && connection.snapshot().sessionMode !== 'custom') throw new Error('请先点击“自己配置 API”完成访客模式切换，再保存个人配置。');
+      const config = await api('/api/config', { method: 'PUT', body: settingsPayload() });
+      if (!current()) return;
+      state.config = config;
+      if (ownerAI && ownerChoice === 'custom') { ownerNeedsPersonalKey = false; ownerAppliedRevision = -1; rememberOwnerChoice('custom'); }
       engineDraftIds = null;
       await loadSearchEngines();
+      if (!current()) return;
       updateConnection();
       updateSecretLabels(state.config);
       ['api-key', 'tavily-key', 'brave-key'].forEach(id => { $(`#${id}`).value = ''; });
+      if (ownerAI && ownerChoice === 'shared') $('#api-key').value = ownerAI.api_key;
       ['clear-api', 'clear-tavily', 'clear-brave'].forEach(id => { $(`#${id}`).checked = false; });
       if (testConnection) {
         const result = await api('/api/ai/test', { method: 'POST', body: {}, timeout: 120000 });
+        if (!current()) return;
         notice('#settings-feedback', result.message || (result.ok ? '连接成功，模型可以正常响应。' : '设置已保存，但连接测试失败。'), Boolean(result.ok));
       } else {
         $('#settings-dialog').close();
         toast('设置已保存');
       }
-    } catch (error) { notice('#settings-feedback', error.message); }
-    finally { $('#save-settings').disabled = false; $('#test-ai').disabled = false; }
+    } catch (error) { if (current() && error.code !== 'BACKEND_CHANGED') notice('#settings-feedback', error.message); }
+    finally { endModelOperation(operation); }
   }
 
   function supportsConcurrentSearch() { return connection.snapshot().features.includes('concurrent_search'); }
@@ -599,8 +715,8 @@
   function updateSubmitButton() {
     const button = $('#search-button');
     const connected = connection.snapshot().connected;
-    button.disabled = submissionBusy || (connected && !hasTaskCapacity());
-    button.querySelector('span').textContent = submissionBusy ? '创建任务…' : !connected ? '连接后搜索' : !hasTaskCapacity() ? '运行任务已满' : state.activeJobId ? '作为新任务搜索' : '开始搜索';
+    button.disabled = modelModeBusy || submissionBusy || (connected && !hasTaskCapacity());
+    button.querySelector('span').textContent = modelModeBusy ? '正在配置模型…' : submissionBusy ? '创建任务…' : !connected ? '连接后搜索' : !hasTaskCapacity() ? '运行任务已满' : state.activeJobId ? '作为新任务搜索' : '开始搜索';
     button.title = connected && !hasTaskCapacity() ? `最多同时运行 ${taskLimit()} 个搜索或总结任务。可先停止一个任务。` : '';
   }
 
@@ -724,7 +840,8 @@
 
   async function startSearch(event) {
     if (event) event.preventDefault();
-    if (!ensureBackend() || submissionBusy) return;
+    if (!ensureBackend() || submissionBusy || modelModeBusy) return;
+    if ($('#use-ai').checked && presetConfigurationPending()) { toast('请先应用站主预置，或填写并保存个人 API 配置。'); openSettings(); return; }
     if (!hasTaskCapacity()) { notice('#search-notice', `当前已达到 ${taskLimit()} 个并行任务，请等待或停止一个任务后再创建。`); loadTasks(); return; }
     if (connection.snapshot().visitorSession && $('#use-ai').checked && state.config?.api_mode === 'custom' && !state.config?.has_api_key) { toast('请先为当前访客会话配置自己的模型 API。'); openSettings(); return; }
     const query = $('#query').value.trim(); const platforms = Array.from(state.selectedPlatforms); let customSites;
@@ -851,6 +968,7 @@
 
   async function continueSearch() {
     const entry = currentTask();
+    if (modelModeBusy || (entry?.job.use_ai !== false && presetConfigurationPending())) { toast('请先完成模型配置。'); return; }
     if (!entry || taskActive(entry) || !resumableStates.has(entry.job.state)) return;
     if (!hasTaskCapacity()) { notice('#search-notice', `已有 ${taskLimit()} 个任务运行，请等待或停止其中一个后继续。`); loadTasks(); return; }
     const epoch = taskEpoch; const body = { max_rounds: roundBudget(), depth: searchDepth() };
@@ -1280,6 +1398,7 @@
   }
 
   async function generateSummary() {
+    if (modelModeBusy || presetConfigurationPending()) { toast('请先完成模型配置。'); return; }
     const entry = currentTask(); const job = entry?.job;
     const resumePolling = Boolean(entry?.summaryError && job?.ai_summary?.state === 'running');
     if (!job || (taskActive(entry) && !resumePolling) || !resumableStates.has(job.state) || !Array.isArray(job.results) || !job.results.length) return;
@@ -1651,15 +1770,21 @@
   $('#import-form').addEventListener('submit', importItem);
   ['#open-backend','#connect-backend'].forEach(selector => $(selector).addEventListener('click', openBackend));
   $('#backend-form').addEventListener('submit', saveBackend);
-  $('#disconnect-backend').addEventListener('click', () => { connection.disconnect(); $('#backend-token').value=''; $('#backend-dialog').close(); });
+  $('#disconnect-backend').addEventListener('click', () => { ownerApplyOnConnect = false; connection.disconnect(); $('#backend-token').value=''; $('#backend-dialog').close(); });
   $('#search-button').addEventListener('click', event => { if (!connection.snapshot().connected) { event.preventDefault(); openBackend(); } });
   $('#query').addEventListener('input', renderOfflineLinks);
   connection.subscribe((backend, reason) => {
     if (reason === 'changing' || reason === 'disconnected' || reason === 'session-expired') resetBackendView();
+    if (ownerAI && reason === 'connected') {
+      const choice = savedOwnerChoice();
+      if (choice === 'custom' || choice === 'custom_pending') ownerChoice = 'custom';
+      ownerNeedsPersonalKey = choice === 'custom_pending';
+    }
     updateConnection();
     if (reason === 'failed' || reason === 'session-expired') notice('#search-notice', backend.message);
     if (initialized && (reason === 'connected' || reason === 'disconnected')) refreshBackendData();
   });
+  if (ownerAI) { const choice = savedOwnerChoice(); if (choice === 'custom' || choice === 'custom_pending') ownerChoice = 'custom'; ownerNeedsPersonalKey = choice === 'custom_pending'; }
   updateAdaptiveControls();
   updateDepthDescription();
   connection.catalog().then(data => { offlinePlatforms = Array.isArray(data.items) ? data.items : []; renderOfflineLinks(); });

@@ -1,11 +1,19 @@
 import json
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.parse import urljoin
 
-from scripts.build_pages import BuildError, STATIC_FILES, build_pages, normalize_api_base
+from scripts.build_pages import (BuildError, STATIC_FILES, build_pages, main,
+                                 normalize_api_base, normalize_owner_ai, owner_ai_from_environment)
+
+
+OWNER = {"baseURL": "https://model.example/v1", "model": "public-test-model", "apiKey": "sk-" + "P" * 44}
+OWNER_ENV = {"XUNWEI_PAGES_PUBLIC_OWNER_API": "1", "XUNWEI_PAGES_OWNER_BASE_URL": OWNER['baseURL'],
+             "XUNWEI_PAGES_OWNER_MODEL": OWNER['model'], "XUNWEI_PAGES_OWNER_API_KEY": OWNER['apiKey']}
 
 
 class PagesBuildTests(unittest.TestCase):
@@ -63,6 +71,61 @@ class PagesBuildTests(unittest.TestCase):
     def test_explicit_public_https_base_has_no_token_field(self):
         output = build_pages(self.root, "https://api.example.com/search-service/")
         self.assertEqual(self.configuration(output), {"mode": "pages", "apiBase": "https://api.example.com/search-service"})
+
+    def test_explicit_owner_preset_only_enters_generated_config_and_never_changes_source(self):
+        original = {path.name: path.read_text(encoding='utf-8') for path in self.web.iterdir()}
+        output = build_pages(self.root, 'https://search.example', owner_ai=OWNER)
+        self.assertEqual(self.configuration(output), {'mode': 'pages', 'apiBase': 'https://search.example', 'ownerAI': OWNER})
+        containing_key = [path.name for path in output.iterdir() if OWNER['apiKey'] in path.read_text(encoding='utf-8')]
+        self.assertEqual(containing_key, ['deployment-config.js'])
+        self.assertIn('every visitor can read', (output / 'deployment-config.js').read_text(encoding='utf-8'))
+        self.assertEqual({path.name: path.read_text(encoding='utf-8') for path in self.web.iterdir()}, original)
+        # A later ordinary build removes the public preset even after an opt-in build.
+        build_pages(self.root)
+        self.assertEqual(self.configuration(output), {'mode': 'pages', 'apiBase': ''})
+        self.assertNotIn(OWNER['apiKey'], '\n'.join(path.read_text(encoding='utf-8') for path in output.iterdir()))
+
+    def test_library_build_ignores_even_opted_in_cli_environment_without_explicit_argument(self):
+        with patch.dict('os.environ', OWNER_ENV, clear=True):
+            output = build_pages(self.root)
+        self.assertNotIn('ownerAI', self.configuration(output))
+        self.assertNotIn(OWNER['apiKey'], '\n'.join(path.read_text(encoding='utf-8') for path in output.iterdir()))
+
+    def test_owner_opt_in_does_not_relax_static_asset_scan(self):
+        for name in ('app.js', 'deployment-config.js', 'platforms.json'):
+            path = self.web / name
+            original = path.read_text(encoding='utf-8')
+            with self.subTest(name=name):
+                path.write_text('const accidentalKey = ' + json.dumps(OWNER['apiKey']) + ';', encoding='utf-8')
+                with self.assertRaises(BuildError) as caught:
+                    build_pages(self.root, owner_ai=OWNER)
+                self.assertNotIn(OWNER['apiKey'], str(caught.exception))
+            path.write_text(original, encoding='utf-8')
+
+    def test_invalid_owner_preserves_previous_build_and_has_value_free_error(self):
+        output = build_pages(self.root)
+        original = (output / 'deployment-config.js').read_text(encoding='utf-8')
+        invalid = [[], {}, {**OWNER, 'extra': 'unapproved'}, {**OWNER, 'baseURL': ''},
+                   {**OWNER, 'baseURL': 'http://localhost:8765/v1'},
+                   {**OWNER, 'baseURL': 'https://user:secret@model.example/v1'},
+                   {**OWNER, 'baseURL': 'https://model.example/v1?key=' + OWNER['apiKey']},
+                   {**OWNER, 'baseURL': 'https://model.example/v1?'},
+                   {**OWNER, 'baseURL': 'https://model.example/v1#'},
+                   {**OWNER, 'baseURL': 'https://model.example/%0Apath'},
+                   {**OWNER, 'model': ''}, {**OWNER, 'model': 'm' * 151}, {**OWNER, 'model': 'test\nmodel'},
+                   {**OWNER, 'model': OWNER['apiKey']}, {**OWNER, 'apiKey': ''},
+                   {**OWNER, 'apiKey': OWNER['apiKey'] + '\n'}, {**OWNER, 'apiKey': 'contains space'},
+                   {**OWNER, 'apiKey': '密钥'}, {**OWNER, 'apiKey': 'x' * 4097}]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(BuildError) as caught:
+                build_pages(self.root, owner_ai=value)
+            self.assertNotIn(OWNER['apiKey'], str(caught.exception))
+            self.assertEqual((output / 'deployment-config.js').read_text(encoding='utf-8'), original)
+
+    def test_owner_strings_are_serialized_as_data(self):
+        owner = {**OWNER, 'model': 'provider/model-"quoted"', 'apiKey': 'opaque-"quoted"-\\key'}
+        output = build_pages(self.root, owner_ai=owner)
+        self.assertEqual(self.configuration(output)['ownerAI'], owner)
 
     def test_relative_resources_work_at_a_project_subpath(self):
         output = build_pages(self.root)
@@ -149,6 +212,52 @@ class PublicApiBaseTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(BuildError) as caught:
                 normalize_api_base(url)
             self.assertNotIn(url, str(caught.exception))
+
+
+class PublicOwnerEnvironmentTests(unittest.TestCase):
+    def test_cli_default_does_not_read_generic_model_keys(self):
+        self.assertIsNone(owner_ai_from_environment({'AI_API_KEY': OWNER['apiKey'], 'OPENAI_API_KEY': OWNER['apiKey']}))
+        self.assertIsNone(owner_ai_from_environment({'XUNWEI_PAGES_PUBLIC_OWNER_API': '0'}))
+
+    def test_owner_fields_without_explicit_opt_in_are_rejected_without_echo(self):
+        for flag in ('', '0', 'true'):
+            environment = {**OWNER_ENV, 'XUNWEI_PAGES_PUBLIC_OWNER_API': flag}
+            with self.subTest(flag=flag), self.assertRaises(BuildError) as caught:
+                owner_ai_from_environment(environment)
+            self.assertIn('explicitly', str(caught.exception))
+            self.assertNotIn(OWNER['apiKey'], str(caught.exception))
+
+    def test_incomplete_opt_in_is_rejected_without_echo(self):
+        for missing in ('XUNWEI_PAGES_OWNER_BASE_URL', 'XUNWEI_PAGES_OWNER_MODEL', 'XUNWEI_PAGES_OWNER_API_KEY'):
+            environment = dict(OWNER_ENV)
+            del environment[missing]
+            with self.subTest(missing=missing), self.assertRaises(BuildError) as caught:
+                owner_ai_from_environment(environment)
+            self.assertIn('incomplete', str(caught.exception))
+            self.assertNotIn(OWNER['apiKey'], str(caught.exception))
+
+    def test_valid_opt_in_passes_exact_preset_to_cli_build_without_printing_values(self):
+        output = StringIO()
+        with patch.dict('os.environ', OWNER_ENV, clear=True), patch('scripts.build_pages.build_pages') as build, redirect_stdout(output):
+            self.assertEqual(main(), 0)
+        self.assertEqual(build.call_args.args[2], OWNER)
+        self.assertIn('Every visitor can read', output.getvalue())
+        for value in OWNER.values():
+            self.assertNotIn(value, output.getvalue())
+
+    def test_invalid_cli_configuration_never_starts_build_or_prints_supplied_values(self):
+        environment = {**OWNER_ENV, 'XUNWEI_PAGES_OWNER_MODEL': OWNER['apiKey']}
+        output = StringIO()
+        with patch.dict('os.environ', environment, clear=True), patch('scripts.build_pages.build_pages') as build, redirect_stdout(output):
+            self.assertEqual(main(), 1)
+        build.assert_not_called()
+        self.assertIn('Pages build failed', output.getvalue())
+        self.assertNotIn(OWNER['apiKey'], output.getvalue())
+
+    def test_https_model_base_and_bounded_opaque_fields(self):
+        normalized = normalize_owner_ai({**OWNER, 'baseURL': 'https://MODEL.EXAMPLE/v1/', 'model': '  model/test  '})
+        self.assertEqual(normalized, {**OWNER, 'model': 'model/test'})
+        self.assertEqual(len(normalize_owner_ai({**OWNER, 'apiKey': 'x' * 4096})['apiKey']), 4096)
 
 
 if __name__ == "__main__":

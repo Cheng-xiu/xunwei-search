@@ -2,7 +2,10 @@
 
 No backend modules, settings files, search history, or imported documents are
 read. docs/ is a disposable build directory and is replaced on a successful
-build. XUNWEI_PAGES_API_BASE is a public URL, never a credential.
+build. XUNWEI_PAGES_API_BASE is a public URL, never a credential. An explicitly
+enabled owner API preset is public in the generated deployment configuration:
+every visitor can read its key. A CI secret only keeps that key out of source
+and build logs; it cannot protect the key in the published JavaScript.
 """
 from __future__ import annotations
 
@@ -22,6 +25,8 @@ STATIC_FILES = (
     "deployment-config.js", "platforms.json",
 )
 SECRET_SHAPE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b")
+OWNER_ENV = {"baseURL": "XUNWEI_PAGES_OWNER_BASE_URL", "model": "XUNWEI_PAGES_OWNER_MODEL",
+             "apiKey": "XUNWEI_PAGES_OWNER_API_KEY"}
 
 
 class BuildError(ValueError):
@@ -66,6 +71,41 @@ def normalize_api_base(value: str) -> str:
         raise BuildError("The public API base is not a valid URL.") from None
 
 
+def normalize_owner_ai(value) -> dict | None:
+    """Validate an explicit public preset without echoing any supplied values."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"baseURL", "model", "apiKey"}:
+        raise BuildError("Public owner API requires exactly baseURL, model and apiKey; all three will be public.")
+    base, model, key = value["baseURL"], value["model"], value["apiKey"]
+    if not isinstance(base, str) or "?" in base or "#" in base:
+        raise BuildError("Public owner API requires an HTTPS model URL without credentials, query or fragment.")
+    # Retain the same hostname/path checks as the search-service base, but do
+    # not permit its HTTP localhost preview exception for model configuration.
+    base = normalize_api_base(base)
+    if not base or urlsplit(base).scheme != "https":
+        raise BuildError("Public owner API requires an HTTPS model URL without credentials, query or fragment.")
+    if (not isinstance(model, str) or re.search(r"[\x00-\x1f\x7f]", model)
+            or not 1 <= len(model.strip()) <= 150 or SECRET_SHAPE.search(model)):
+        raise BuildError("Public owner model must be 1-150 characters without control characters or credentials.")
+    if not isinstance(key, str) or not 1 <= len(key) <= 4096 or re.search(r"[^\x21-\x7e]", key):
+        raise BuildError("Public owner API key must be 1-4096 printable ASCII characters without spaces.")
+    return {"baseURL": base, "model": model.strip(), "apiKey": key}
+
+
+def owner_ai_from_environment(environment) -> dict | None:
+    """CLI-only opt-in; ordinary library builds never read environment keys."""
+    enabled = environment.get("XUNWEI_PAGES_PUBLIC_OWNER_API", "")
+    values = {field: environment.get(name, "") for field, name in OWNER_ENV.items()}
+    if enabled != "1":
+        if enabled not in ("", "0") or any(values.values()):
+            raise BuildError("Owner API publishing is disabled. Set XUNWEI_PAGES_PUBLIC_OWNER_API=1 explicitly; its generated key is readable by every visitor.")
+        return None
+    if not all(values.values()):
+        raise BuildError("Public owner API is enabled but incomplete. Set its BASE_URL, MODEL and API_KEY; the generated key will be public.")
+    return normalize_owner_ai(values)
+
+
 def _is_link(path: Path) -> bool:
     return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
 
@@ -89,7 +129,7 @@ class _RelativeResources(HTMLParser):
                 raise BuildError("HTML references a file outside the static build allowlist.")
 
 
-def build_pages(project_root: Path | str, api_base: str = "") -> Path:
+def build_pages(project_root: Path | str, api_base: str = "", owner_ai: dict | None = None) -> Path:
     root = Path(project_root).resolve(strict=True)
     source = root / "web"
     output = root / "docs"
@@ -98,6 +138,7 @@ def build_pages(project_root: Path | str, api_base: str = "") -> Path:
     if _is_link(output) or output.resolve().parent != root or (output.exists() and not output.is_dir()):
         raise BuildError("The docs build target must be an ordinary directory directly inside the project.")
     public_base = normalize_api_base(api_base)
+    public_owner = normalize_owner_ai(owner_ai)
     contents = {}
     for name in STATIC_FILES:
         path = source / name
@@ -119,10 +160,13 @@ def build_pages(project_root: Path | str, api_base: str = "") -> Path:
     if SECRET_SHAPE.search(json.dumps(catalog, ensure_ascii=False)):
         raise BuildError("Credential-shaped content found in the public platform catalog.")
     _RelativeResources().feed(contents["index.html"])
-    contents["deployment-config.js"] = (
-        "// Public deployment configuration. Never put credentials in this file.\n"
-        "window.XUNWEI_DEPLOYMENT = " + json.dumps({"mode": "pages", "apiBase": public_base}, ensure_ascii=True) + ";\n"
-    )
+    deployment = {"mode": "pages", "apiBase": public_base}
+    comment = "// Public deployment configuration. Never put credentials in this file.\n"
+    if public_owner is not None:
+        deployment["ownerAI"] = public_owner
+        comment = ("// Explicit PUBLIC owner API preset: every visitor can read this key.\n"
+                   "// A CI secret prevents source/log exposure, not access to this generated JavaScript.\n")
+    contents["deployment-config.js"] = comment + "window.XUNWEI_DEPLOYMENT = " + json.dumps(deployment, ensure_ascii=True) + ";\n"
     with tempfile.TemporaryDirectory(prefix=".pages-build-", dir=root) as temporary:
         staging = Path(temporary)
         for name, content in contents.items():
@@ -140,13 +184,16 @@ def build_pages(project_root: Path | str, api_base: str = "") -> Path:
 
 def main():
     try:
-        output = build_pages(Path(__file__).resolve().parents[1], os.environ.get("XUNWEI_PAGES_API_BASE", ""))
+        owner_ai = owner_ai_from_environment(os.environ)
+        output = build_pages(Path(__file__).resolve().parents[1], os.environ.get("XUNWEI_PAGES_API_BASE", ""), owner_ai)
     except (BuildError, OSError) as error:
         # Do not print arbitrary filesystem errors containing source contents or
         # user-provided URLs. BuildError messages are deliberately value-free.
         print("Pages build failed: " + (str(error) if isinstance(error, BuildError) else "filesystem operation failed"))
         return 1
     print("Built docs/ with " + str(len(STATIC_FILES) + 1) + " public static files. Backend and user data were excluded.")
+    if owner_ai is not None:
+        print("Public owner API preset included. Every visitor can read the generated API key.")
     return 0
 
 

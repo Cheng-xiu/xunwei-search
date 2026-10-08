@@ -61,6 +61,12 @@ jobs:
           # This repository variable is a PUBLIC HTTPS service URL, not a key.
           # Leave unset to let each visitor configure their own backend.
           XUNWEI_PAGES_API_BASE: ${{ vars.XUNWEI_PAGES_API_BASE }}
+          # Explicitly opting in publishes ownerAI.apiKey to EVERY visitor.
+          # GitHub Secrets keeps it out of source/logs, NOT the public artifact.
+          XUNWEI_PAGES_PUBLIC_OWNER_API: ${{ vars.XUNWEI_PAGES_PUBLIC_OWNER_API }}
+          XUNWEI_PAGES_OWNER_BASE_URL: ${{ vars.XUNWEI_PAGES_PUBLIC_OWNER_API == '1' && vars.XUNWEI_PAGES_OWNER_BASE_URL || '' }}
+          XUNWEI_PAGES_OWNER_MODEL: ${{ vars.XUNWEI_PAGES_PUBLIC_OWNER_API == '1' && vars.XUNWEI_PAGES_OWNER_MODEL || '' }}
+          XUNWEI_PAGES_OWNER_API_KEY: ${{ vars.XUNWEI_PAGES_PUBLIC_OWNER_API == '1' && secrets.XUNWEI_PAGES_OWNER_API_KEY || '' }}
         run: python scripts/build_pages.py
       - name: Upload only generated frontend
         uses: actions/upload-pages-artifact@v5.0.0
