@@ -132,31 +132,51 @@ def make_plan(query, config, use_ai, warn, public_post_only=False):
     return plan
 
 
-def build_tasks(plan, platforms, depth, config):
+def build_tasks(plan, platforms, depth, config, sites=None):
     providers = available_providers(config)
     web_providers = [p for p in providers if p not in DIRECT_PROVIDERS]
-    # Use configured engines first, with free fallback kept if configured upstream fails.
     paid = [p for p in web_providers if p in ('tavily', 'brave', 'searxng')]
-    engines = (paid[:1] + ['bing']) if paid else web_providers[:2]
-    variants = [x['query'] for x in plan['queries']]
+    engines = paid + [p for p in web_providers if p not in paid]
     profile = depth_profile(depth)
-    max_queries = max(len(platforms), profile['requests'] // max(1, len(engines)))
-    targeted = []
-    for variant in variants:
-        for p in platforms:
-            targeted.append((variant if p == 'web' else f'{variant} site:{DOMAINS[p]}', p))
-    targeted = list(dict.fromkeys(targeted))[:max_queries]
-    tasks = [(engine, q, [p]) for q, p in targeted for engine in engines]
-    native = [(provider, q, [provider]) for q in variants[:profile['variants']]
-              for provider in platforms if provider in DIRECT_PROVIDERS and provider in providers]
-    first = []
-    for platform in platforms:
-        if any(task[2] == [platform] for task in native):
+    variants = list(dict.fromkeys(x['query'] for x in plan['queries']))[:profile['variants']]
+    # Sites, native APIs and search engines share one request budget. Give each
+    # scope one request, then fairly interleave its remaining engine/query work.
+    targets = [('website:' + site['domain'], site) for site in sites or []]
+    targets += [(platform, None) for platform in dict.fromkeys(platforms)]
+    queues = {}
+    for index, (target, site) in enumerate(targets):
+        offset = index % len(engines) if engines else 0
+        rotated = engines[offset:] + engines[:offset]
+        if site:
+            sources = ['website'] if site.get('search_url') else rotated
+            texts = variants
+        else:
+            sources = ([target] if target in DIRECT_PROVIDERS and target in providers else []) + rotated
+            texts = [variant if target == 'web' else f'{variant} site:{DOMAINS[target]}' for variant in variants]
+        # Native searches receive the plain query, never a generic site filter.
+        queues[target] = [(source, variant if source in DIRECT_PROVIDERS else text, [target])
+                          for variant, text in zip(variants, texts) for source in sources]
+    tasks = []
+    for target, _ in targets:
+        if queues[target] and len(tasks) < profile['requests']:
+            tasks.append(queues[target].pop(0))
+    for source in engines:
+        if any(task[0] == source for task in tasks):
             continue
-        task = next((task for task in tasks if task[2] == [platform]), None)
-        if task:
-            first.append(task)
-    return (native + first + [task for task in tasks if task not in first])[:profile['requests']]
+        candidate = next(((target, index) for target, _ in targets for index, task in enumerate(queues[target])
+                          if task[0] == source), None)
+        if candidate and len(tasks) < profile['requests']:
+            tasks.append(queues[candidate[0]].pop(candidate[1]))
+    while len(tasks) < profile['requests']:
+        changed = False
+        for target, _ in targets:
+            if queues[target] and len(tasks) < profile['requests']:
+                tasks.append(queues[target].pop(0))
+                changed = True
+        if not changed:
+            break
+    # Keep native API work first without letting it displace scope coverage.
+    return [task for task in tasks if task[0] in DIRECT_PROVIDERS] + [task for task in tasks if task[0] not in DIRECT_PROVIDERS]
 
 
 def clean_result(item, query):
@@ -174,7 +194,7 @@ def clean_result(item, query):
               'views': item.get('views') if isinstance(item.get('views'), int) and item['views'] >= 0 else None,
               'published': str(item.get('published', ''))[:100], 'evidence': [], 'match': 'unverified',
               'reason': '仅完成关键词匹配，尚未逐条核实条件。'}
-    for key in ('site', 'domain', 'content_kind'):
+    for key in ('site', 'domain', 'content_kind', 'engine'):
         if item.get(key):
             result[key] = str(item[key])[:250]
     result['score'] = round(min(65, relevance(query, result)*65))
@@ -310,9 +330,7 @@ def _run_single_search(job, config, storage, update):
                 seen_local.add(item['id'])
                 gathered.append(item)
     statuses.append({'provider': 'local', 'ok': True, 'count': len(gathered)})
-    tasks = build_tasks(plan, platforms, job['depth'], config)
-    for site in sites:
-        tasks.extend(('website:' + site['domain'], item['query'], ['website']) for item in plan['queries'][:1 if job['depth'] == 'quick' else 2])
+    tasks = build_tasks(plan, platforms, job['depth'], config, sites)
     retrieval_config = {**config, '_search_depth': job['depth']}
     if re.search(r'\bissue\b|\bbug\b|\berror\b|故障|报错|不触发', query, re.I):
         retrieval_config['_github_search_kind'] = 'issues'
@@ -320,9 +338,9 @@ def _run_single_search(job, config, storage, update):
     def retrieve(provider, text, scope):
         if config['_cancel_event'].is_set():
             return {'results': [], 'status': {'provider': provider, 'ok': False, 'count': 0, 'error': '已停止'}}
-        if provider.startswith('website:'):
-            site = next(site for site in sites if site['domain'] == provider.split(':', 1)[1])
-            return search_custom_site(site, text, provider_limit, retrieval_config)
+        if scope[0].startswith('website:'):
+            site = next(site for site in sites if site['domain'] == scope[0].split(':', 1)[1])
+            return search_custom_site(site, text, provider_limit, {**retrieval_config, '_engine': provider})
         return search_provider(provider, text, scope, provider_limit, retrieval_config)
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futures = {pool.submit(retrieve, p, q, scope): (p, q) for p, q, scope in tasks}
@@ -418,11 +436,7 @@ def _run_single_search(job, config, storage, update):
     completed_queries = []
     for provider, text, scope in tasks:
         target = scope[0]
-        if provider.startswith('website:'):
-            target = provider
-            site = next(site for site in sites if 'website:' + site['domain'] == target)
-            provider = 'website' if site.get('search_url') else 'bing'
-        elif target in DOMAINS and provider not in DIRECT_PROVIDERS:
+        if target in DOMAINS and provider not in DIRECT_PROVIDERS:
             suffix = ' site:' + DOMAINS[target]
             if text.endswith(suffix):
                 text = text[:-len(suffix)]

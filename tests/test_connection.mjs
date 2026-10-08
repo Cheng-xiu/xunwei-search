@@ -34,8 +34,82 @@ test('Pages without a backend reads only the relative static catalog and rejects
   assert.equal((await connection.request('/api/config')).offline, true);
   assert.equal((await connection.request('/api/history')).items.length, 0);
   assert.equal((await connection.request('/api/library')).items.length, 0);
+  const engines = await connection.searchEngines();
+  assert.equal(engines.items.length, 8);
+  assert.equal(engines.selection_supported, false);
+  assert.deepEqual(Array.from(engines.items.filter(item => item.available).map(item => item.id)), ['baidu', 'bing', 'google', 'yandex', 'duckduckgo']);
   await assert.rejects(connection.request('/api/search', { method: 'POST', body: { query: 'offline' } }), { code: 'BACKEND_REQUIRED' });
   assert.deepEqual(calls.map(call => call.url), ['./platforms.json']);
+});
+
+test('Older backends without an engine catalog remain connected with compatible defaults', async () => {
+  const { connection, calls } = setup({ handler: url => {
+    if (url.endsWith('/api/health')) return json({ ok: true });
+    if (url.endsWith('/api/platforms')) return json(platforms);
+    return json({ error: 'Unknown route' }, 404);
+  } });
+  await connection.connect('https://older.example');
+  const catalog = await connection.searchEngines();
+  assert.equal(catalog.items.length, 8);
+  assert.equal(catalog.selection_supported, false);
+  assert.equal(connection.snapshot().connected, true);
+  assert(calls.every(call => (call.options.method || 'GET') === 'GET'));
+});
+
+test('Engine catalog availability is reported independently of connection authentication', async () => {
+  const service = publicService();
+  const { connection } = setup({ handler: (url, options) => url.endsWith('/api/search-engines') ? json({ items: [{ id: 'google', label: 'Google', access: 'public_html', available: true, configured: true, description: 'May be blocked', search_url: 'https://www.google.com/search?q={query}' }, { id: 'unknown-script', label: 'Unrecognized' }] }) : service.handler(url, options) });
+  await connection.connect('https://public.example');
+  const catalog = await connection.searchEngines();
+  assert.equal(catalog.selection_supported, true);
+  assert.equal(catalog.items.length, 1);
+  assert.equal(catalog.items[0].id, 'google');
+  assert.equal(connection.snapshot().sessionMode, 'shared');
+  assert.equal(service.count(), 1);
+});
+
+test('All free manual engines honor selected platform domains without an implicit whole-web scope', async () => {
+  const { connection, calls } = setup();
+  const engines = (await connection.searchEngines()).items.filter(item => item.available);
+  const links = connection.engineLinks({ query: '冷门菜品 & 评价', engines, platforms: platforms.items, selectedPlatforms: ['zhihu', 'bilibili'] });
+  assert.equal(links.length, 15);
+  assert.equal(new Set(links.map(link => link.engine)).size, 5);
+  for (const link of links) {
+    assert(['zhihu.com', 'bilibili.com', 'b23.tv'].includes(link.domain));
+    assert.equal(link.query, `冷门菜品 & 评价 site:${link.domain}`);
+    const parsed = new URL(link.url);
+    assert.equal(parsed.protocol, 'https:');
+    assert([...parsed.searchParams.values()].includes(link.query));
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('Custom-only manual search stays scoped and only explicit web selection creates a broad link', async () => {
+  const { connection } = setup();
+  const engines = (await connection.searchEngines()).items.filter(item => item.id === 'bing');
+  const options = { query: '校园 食堂', engines, platforms: platforms.items, selectedPlatforms: [], customSites: [{ name: '校园论坛', domain: 'bbs.example.org' }, { domain: 'bbs.example.org' }, { domain: 'bad.example/path' }] };
+  const restricted = connection.engineLinks(options);
+  assert.equal(restricted.length, 1);
+  assert.equal(restricted[0].query, '校园 食堂 site:bbs.example.org');
+  const broad = connection.engineLinks({ ...options, selectedPlatforms: ['web'] });
+  assert.equal(broad.length, 2);
+  assert.equal(broad.filter(link => !link.domain).length, 1);
+  assert.equal(broad.find(link => !link.domain).scope, '公开全网');
+  assert.equal(connection.engineLinks({ ...options, customSites: [] }).length, 0);
+});
+
+test('Manual search ignores credentialed, unsafe, or non-template engine URLs', async () => {
+  const { connection } = setup();
+  const links = connection.engineLinks({ query: '<script> & #', platforms: platforms.items, selectedPlatforms: ['web'], engines: [
+    { id: 'bad-js', search_url: 'javascript:alert({query})' },
+    { id: 'bad-http', search_url: 'http://search.example?q={query}' },
+    { id: 'bad-user', search_url: 'https://user:password@search.example?q={query}' },
+    { id: 'bad-template', search_url: 'https://search.example?q={query}&again={query}' },
+    { id: 'no-template', search_url: '' },
+    { id: 'valid', label: 'Search', search_url: 'https://search.example?q={query}' }
+  ] });
+  assert.equal(links.length, 1);
+  assert.equal(new URL(links[0].url).searchParams.get('q'), '<script> & #');
 });
 
 test('Local default retains same-origin API paths after health and catalog verification', async () => {

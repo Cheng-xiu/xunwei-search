@@ -15,6 +15,10 @@
   let offlinePlatforms = [];
   let requestedModelMode;
   let modelModeBusy = false;
+  let searchEngineItems = [];
+  let engineSelectionSupported = false;
+  let engineDraftIds = null;
+  const engineNames = { baidu: '百度', bing: '必应 Bing', google: 'Google', yandex: 'Yandex', duckduckgo: 'DuckDuckGo', tavily: 'Tavily', brave: 'Brave Search', searxng: 'SearXNG' };
 
   function node(tag, className, content) {
     const element = document.createElement(tag);
@@ -216,6 +220,9 @@
     $('#import-form').reset();
     ['api-key','tavily-key','brave-key'].forEach(id => { $(`#${id}`).value = ''; });
     notice('#model-mode-feedback', '');
+    engineSelectionSupported = false;
+    engineDraftIds = null;
+    searchEngineItems = [];
     $('#views-filter').value = 'all';
     $$('[data-filter]').forEach(button => { button.classList.toggle('active', button.dataset.filter === 'all'); button.setAttribute('aria-pressed', String(button.dataset.filter === 'all')); });
     ['export-results','result-tools','answer-summary','ai-summary-card','rounds-card','job-status-panel','progress-panel'].forEach(id => toggle($(`#${id}`), false));
@@ -233,23 +240,92 @@
   }
 
   async function refreshBackendData() {
-    await Promise.allSettled([loadConfig(), loadHistory(), loadLibrary(), loadPlatforms()]);
+    await Promise.allSettled([loadConfig(), loadHistory(), loadLibrary(), loadPlatforms(), loadSearchEngines()]);
     updateConnection();
   }
 
   function renderOfflineLinks() {
+    renderEngineLinks();
     if (connection.snapshot().connected || state.job) return;
     const query = $('#query').value.trim();
     if (!query) { renderNativeLinks([]); return; }
-    renderNativeLinks(offlinePlatforms.filter(item => state.selectedPlatforms.has(item.id) && item.search_url).map(item => ({
+    let sites = [];
+    try { sites = collectSites(); } catch (_) { /* Incomplete site fields do not create links. */ }
+    renderNativeLinks([...offlinePlatforms.filter(item => state.selectedPlatforms.has(item.id) && item.id !== 'web' && item.search_url).map(item => ({
       platform: item.id, label: item.search_label || `${item.label}搜索`, query,
       url: item.search_url.replace('{query}', encodeURIComponent(query))
-    })));
+    })), ...sites.filter(site => site.search_url).map(site => ({ label: `${site.name || site.domain}站内搜索`, query, url: site.search_url.replace('{query}', encodeURIComponent(query)) }))]);
   }
 
   async function loadConfig() {
-    try { state.config = await api('/api/config'); updateConnection(); if (!state.sitesDirty) renderSiteRows(state.config.custom_sites || []); }
+    try { state.config = await api('/api/config'); updateConnection(); if (!state.sitesDirty) renderSiteRows(state.config.custom_sites || []); renderEngineChoices(); renderEngineLinks(); }
     catch (error) { if (error.code === 'BACKEND_CHANGED') return; $('#connection-pill span').textContent = '服务未连接'; notice('#search-notice', error.message); }
+  }
+
+  function selectedEngineIds(configured = state.config?.search_engines) {
+    if (Array.isArray(configured) && configured.length) return new Set(configured.filter(id => searchEngineItems.some(item => item.id === id)));
+    return new Set(searchEngineItems.filter(item => item.available === true || (!engineSelectionSupported && ((item.id === 'tavily' && state.config?.has_tavily_key) || (item.id === 'brave' && state.config?.has_brave_key) || (item.id === 'searxng' && state.config?.searxng_url)))).map(item => item.id));
+  }
+
+  async function loadSearchEngines() {
+    try {
+      const data = await connection.searchEngines();
+      searchEngineItems = Array.isArray(data.items) ? data.items : [];
+      engineSelectionSupported = data.selection_supported === true;
+      searchEngineItems.forEach(item => { engineNames[item.id] = item.label || engineNames[item.id]; });
+      renderEngineChoices();
+      renderEngineLinks();
+    } catch (error) { if (error.code !== 'BACKEND_CHANGED' && error.status !== 401) notice('#search-notice', error.message); }
+  }
+
+  function renderEngineChoices() {
+    const container = $('#search-engine-options');
+    const selected = engineDraftIds || selectedEngineIds();
+    container.replaceChildren();
+    searchEngineItems.forEach(item => {
+      const label = node('label', 'engine-option');
+      const input = node('input');
+      input.type = 'checkbox';
+      input.value = item.id;
+      input.name = 'search_engine';
+      input.checked = selected.has(item.id);
+      input.disabled = !engineSelectionSupported;
+      input.dataset.engine = item.id;
+      const copy = node('span');
+      const free = item.access !== 'api';
+      const configured = item.configured || (item.id === 'tavily' && state.config?.has_tavily_key) || (item.id === 'brave' && state.config?.has_brave_key) || (item.id === 'searxng' && state.config?.searxng_url);
+      copy.append(node('strong', '', item.label), node('small', '', free ? '免费网页检索 · 可能受限' : configured ? '自配服务 · 已有配置' : '自配服务 · 需填写下方配置'));
+      label.title = item.description || '';
+      label.append(input, copy);
+      container.append(label);
+    });
+    $('#search-engine-hint').textContent = !connection.snapshot().connected ? '连接搜索服务后可保存引擎选择。未连接时可使用下方的手动搜索入口。' : !engineSelectionSupported ? '当前服务未提供搜索引擎目录，使用兼容默认值；升级服务后可保存选择。其他设置仍可使用。' : '默认启用五个免费引擎及已配置的搜索 API。勾选只代表尝试使用；实际可用性以每轮检索状态为准。';
+  }
+
+  function renderEngineLinks() {
+    const query = state.job?.query || $('#query').value.trim();
+    let customSites = state.job?.custom_sites || [];
+    if (!state.job) { try { customSites = collectSites(); } catch (_) { customSites = []; } }
+    const ids = selectedEngineIds(state.job?.search_engines || state.config?.search_engines);
+    const engines = searchEngineItems.filter(item => ids.has(item.id));
+    const links = connection.engineLinks({ query, engines, platforms: offlinePlatforms, selectedPlatforms: state.job?.platforms || Array.from(state.selectedPlatforms), customSites });
+    const container = $('#engine-links');
+    const expanded = new Set($$('details[open]', container).map(item => item.dataset.engine));
+    container.replaceChildren();
+    engines.forEach(engine => {
+      const items = links.filter(link => link.engine === engine.id);
+      if (!items.length) return;
+      const group = node('details', 'manual-engine-group');
+      group.dataset.engine = engine.id;
+      group.open = expanded.has(engine.id);
+      const summary = node('summary');
+      summary.append(node('strong', '', engine.label), node('span', '', `${items.length} 个搜索范围`));
+      const list = node('div', 'native-links');
+      items.forEach(link => { const element = sourceLink(`${link.scope} ↗`, link.url, 'native-link'); element.title = link.query; list.append(element); });
+      group.append(summary, list);
+      container.append(group);
+    });
+    toggle($('#engine-links-section'), container.childElementCount > 0);
   }
 
   async function loadPlatforms() {
@@ -313,14 +389,14 @@
       input.maxLength = maxLength;
       input.value = typeof site[key] === 'string' ? site[key] : '';
       input.autocomplete = 'off';
-      input.addEventListener('input', () => { state.sitesDirty = true; notice('#custom-sites-feedback', ''); });
+      input.addEventListener('input', () => { state.sitesDirty = true; notice('#custom-sites-feedback', ''); renderOfflineLinks(); });
       field.append(input);
       row.append(field);
     });
     const remove = node('button', 'remove-site', '移除');
     remove.type = 'button';
     remove.setAttribute('aria-label', '移除这个指定网站');
-    remove.addEventListener('click', () => { row.remove(); state.sitesDirty = true; updateSiteCount(); });
+    remove.addEventListener('click', () => { row.remove(); state.sitesDirty = true; updateSiteCount(); renderOfflineLinks(); });
     row.append(remove);
     return row;
   }
@@ -406,6 +482,7 @@
   }
 
   function fillSettings(config) {
+    engineDraftIds = null;
     $('#base-url').value = config.base_url || '';
     $('#model').value = config.model || '';
     $('#searxng-url').value = config.searxng_url || '';
@@ -413,6 +490,7 @@
     ['clear-api', 'clear-tavily', 'clear-brave'].forEach(id => { $(`#${id}`).checked = false; });
     updateSecretLabels(config);
     updateModelModes();
+    renderEngineChoices();
   }
 
   function updateSecretLabels(config) {
@@ -424,6 +502,10 @@
   function settingsPayload() {
     const readonly = state.config?.ai_config_readonly === true || (connection.snapshot().visitorSession && (state.config?.api_mode || connection.snapshot().sessionMode) === 'shared');
     const payload = { searxng_url: $('#searxng-url').value.trim(), clear_secrets: [] };
+    if (engineSelectionSupported) {
+      payload.search_engines = $$('#search-engine-options input:checked').map(input => input.value);
+      if (!payload.search_engines.length) throw new Error('请至少选择一个搜索引擎。');
+    }
     if (!readonly) {
       payload.base_url = $('#base-url').value.trim();
       payload.model = $('#model').value.trim();
@@ -447,6 +529,8 @@
     notice('#settings-feedback', testConnection ? '正在保存设置并测试 AI 连接…' : '正在保存…');
     try {
       state.config = await api('/api/config', { method: 'PUT', body: settingsPayload() });
+      engineDraftIds = null;
+      await loadSearchEngines();
       updateConnection();
       updateSecretLabels(state.config);
       ['api-key', 'tavily-key', 'brave-key'].forEach(id => { $(`#${id}`).value = ''; });
@@ -706,7 +790,7 @@
         round.queries.forEach(query => {
           const row = node('li');
           row.append(node('span', '', typeof query === 'string' ? query : query.query || ''));
-          if (typeof query === 'object') row.append(node('small', '', [platformNames[query.platform] || query.platform, query.provider].filter(Boolean).join(' · ')));
+          if (typeof query === 'object') row.append(node('small', '', [platformNames[query.platform] || query.platform, engineNames[query.provider] || query.provider].filter(Boolean).join(' · ')));
           queries.append(row);
         });
         item.append(queries);
@@ -1058,7 +1142,7 @@
     const container = $('#provider-status');
     const expanded = new Set($$('.provider-group[open]', container).map(item => item.dataset.provider));
     container.replaceChildren();
-    const names = { local: localBackend() ? '本地资料库' : '服务资料库', bing: 'Bing 网页索引', duckduckgo: 'DuckDuckGo', bilibili: 'B 站公开搜索', tavily: 'Tavily', brave: 'Brave Search', searxng: 'SearXNG' };
+    const names = { ...engineNames, local: localBackend() ? '本地资料库' : '服务资料库', bilibili: 'B 站公开搜索', github: 'GitHub 公开 API', stackoverflow: 'Stack Overflow 公开 API' };
     const groups = new Map();
     list.forEach(provider => {
       const key = provider.provider || provider.name || provider.label || '检索服务';
@@ -1076,7 +1160,7 @@
         else if (['error', 'failed', 'blocked', 'unavailable', 'disabled'].includes(status) || provider.ok === false) failed += 1;
         if (typeof provider.count === 'number') count += provider.count;
       });
-      const label = key === 'local' ? names.local : items[0].label || names[key] || key;
+      const label = names[key] || items[0].label || key;
       const badgeText = success && failed ? '部分响应' : success ? `${count} 条候选` : failed ? '不可用' : '检索中';
       const badge = node('span', `provider-state ${failed ? 'bad' : success ? 'good' : 'neutral'}`, badgeText);
       badge.title = '各次检索返回的候选数量，结果列表会进一步去重和筛选。';
@@ -1108,6 +1192,7 @@
     const container = $('#native-links');
     container.replaceChildren();
     if (Array.isArray(links)) links.forEach(link => {
+      if (link.engine || link.platform === 'web') return;
       if (!safeURL(link.url)) return;
       const text = link.label || link.title || `${platformNames[link.platform] || '平台'}内搜索`;
       const element = sourceLink(`${text} ↗`, link.url, 'native-link');
@@ -1115,6 +1200,7 @@
       container.append(element);
     });
     toggle($('#native-links-section'), container.childElementCount > 0);
+    renderEngineLinks();
   }
 
   function renderResults() {
@@ -1154,7 +1240,9 @@
     const [className, symbol] = platformIcons[result.platform] || ['gray', '◎'];
     badge.append(node('b', `platform-dot ${className}`, symbol), node('span', '', platform));
     top.append(badge);
-    if (result.source) top.append(node('span', '', result.source));
+    const discoveredBy = engineNames[result.engine] || engineNames[result.source];
+    if (discoveredBy) top.append(node('span', 'result-discovery', `发现来源：${discoveredBy}`));
+    else if (result.source) top.append(node('span', '', result.source));
     const matchName = { strong: '匹配充分', partial: '部分匹配', unverified: '待核实' };
     const match = ['strong', 'partial'].includes(result.match) ? result.match : 'unverified';
     const score = typeof result.score === 'number' && Number.isFinite(result.score) ? ` · ${Math.max(0, Math.min(100, Math.round(result.score)))}` : '';
@@ -1359,6 +1447,11 @@
   $('#settings-form').addEventListener('submit', event => { event.preventDefault(); saveSettings(false); });
   $$('[data-model-mode]').forEach(button => button.addEventListener('click', () => changeModelMode(button.dataset.modelMode, true)));
   $('#settings-model-mode').addEventListener('change', () => changeModelMode($('#settings-model-mode').value));
+  $('#search-engine-options').addEventListener('change', event => {
+    if (!event.target.matches('input[data-engine]')) return;
+    engineDraftIds = new Set($$('#search-engine-options input:checked').map(input => input.value));
+    notice('#settings-feedback', '');
+  });
   $('#test-ai').addEventListener('click', () => saveSettings(true));
   $('#search-form').addEventListener('submit', startSearch);
   $('#query').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); startSearch(); } });

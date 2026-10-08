@@ -90,9 +90,14 @@ def _weighted_tasks(query, targets, engines, direct, directions, stats, searched
     positive = {target['id'] for target in targets if stats_by_id.get(target['id'], {}).get('score', 0) > 0}
     top = ranked[0]['id'] if ranked and positive else None
     queues = {}
+    target_indices = {target['id']: index for index, target in enumerate(targets)}
     for target in ranked:
         target_id = target['id']
-        source_engines = _source_engines(target, engines, direct)
+        # Rotate first choices across scopes. Large platform selections must
+        # still explore the whole engine pool inside the existing budget.
+        offset = target_indices[target_id] % len(engines) if engines else 0
+        rotated = list(engines[offset:]) + list(engines[:offset])
+        source_engines = _source_engines(target, rotated, direct)
         texts = list(dict.fromkeys(directions.get(target_id, []))) or ([query] if initial else [])
         if not initial:
             scale = 2 if max_requests > MAX_REQUESTS else 1
@@ -113,6 +118,16 @@ def _weighted_tasks(query, targets, engines, direct, directions, stats, searched
         queue = queues[target['id']]
         if queue and len(tasks) < max_requests:
             tasks.append(queue.pop(0))
+    # A scope with a native/template source may otherwise consume all spare
+    # slots before an additional selected search engine is ever tried.
+    for provider in engines:
+        if any(task['provider'] == provider for task in tasks):
+            continue
+        candidate = next(((target['id'], index) for target in ranked
+                          for index, task in enumerate(queues[target['id']])
+                          if task['provider'] == provider), None)
+        if candidate and len(tasks) < max_requests:
+            tasks.append(queues[candidate[0]].pop(candidate[1]))
     while len(tasks) < max_requests:
         changed = False
         for target in ranked:
@@ -163,8 +178,9 @@ def run_adaptive_search(job, config, storage, update, stop_event):
     generic = [provider for provider in available if provider not in _DIRECT]
     paid = [provider for provider in generic if provider in ('tavily', 'brave', 'searxng')]
     free = [provider for provider in generic if provider not in paid]
-    # A dead paid key must not disable the public-index fallback.
-    engines = (paid[:1] + free[:1] if paid and free else paid[:2] if paid else generic[:2])
+    # Keep every selected and configured engine. Unselected sources are never
+    # injected as fallbacks, including Bing.
+    engines = paid + free
     searched = set()
     retry_directions = {target['id']: [] for target in targets}
     for round_record in rounds:
@@ -400,6 +416,9 @@ def run_adaptive_search(job, config, storage, update, stop_event):
                 directions[key] = [text for text in directions[key] if any(_query_key(provider, text, key) not in searched
                                    for provider in _source_engines(target, engines, direct))]
         active_engines = [provider for provider in engines if provider not in suppressed]
+        if active_engines:
+            offset = absolute_round % len(active_engines)
+            active_engines = active_engines[offset:] + active_engines[:offset]
         active_direct = direct - suppressed
         tasks = _weighted_tasks(query, targets, active_engines, active_direct, directions, stats, searched, initial, profile['requests'])
         if not tasks:

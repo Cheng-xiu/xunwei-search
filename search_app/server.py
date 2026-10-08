@@ -20,7 +20,8 @@ from urllib.parse import urlsplit, unquote
 
 from .ai import test_connection, validate_base_url
 from .engine import run_search
-from .providers import canonical_url, platform_of, platform_catalog, normalize_custom_sites, PLATFORM_LABELS
+from .providers import (canonical_url, platform_of, platform_catalog, normalize_custom_sites,
+                        PLATFORM_LABELS, SEARCH_ENGINE_IDS, search_engine_catalog, available_providers)
 from .safety import check_query
 from .storage import Storage
 from .summarizer import summarize_results
@@ -28,7 +29,8 @@ from .transport import CORS_HEADERS, CORS_METHODS, PublicAccessError, TransportP
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULTS = {'base_url': 'https://api.a6api.com/v1', 'model': 'deepseek-v4.1-flash',
-            'api_key': '', 'tavily_key': '', 'brave_key': '', 'searxng_url': '', 'custom_sites': []}
+            'api_key': '', 'tavily_key': '', 'brave_key': '', 'searxng_url': '',
+            'custom_sites': [], 'search_engines': []}
 SECRET_KEYS = ('api_key', 'tavily_key', 'brave_key')
 FINISHED_STATES = ('done', 'stopped', 'awaiting_user', 'error')
 PUBLIC_READ_TIMEOUT = 10.0
@@ -39,6 +41,14 @@ def round_budget(value):
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 12:
         raise ValueError('轮数须为 1–12；0 表示持续搜索至手动停止或无可继续方向。')
     return value
+
+
+def normalize_search_engines(value):
+    """An empty list means automatic selection; IDs never contain secrets."""
+    if not isinstance(value, list) or len(value) > len(SEARCH_ENGINE_IDS) or any(
+            not isinstance(item, str) or item not in SEARCH_ENGINE_IDS for item in value):
+        raise ValueError('搜索引擎须为支持的来源编号数组。')
+    return list(dict.fromkeys(value))
 
 
 class App:
@@ -60,6 +70,7 @@ class App:
                 data = json.loads(self.config_path.read_text(encoding='utf-8-sig'))
                 self.config.update({k: v for k, v in data.items() if k in DEFAULTS and isinstance(v, str)})
                 self.config['custom_sites'] = normalize_custom_sites(data.get('custom_sites', []))
+                self.config['search_engines'] = normalize_search_engines(data.get('search_engines', []))
             except (ValueError, OSError):
                 print('本地配置无法读取，已使用默认配置。请在设置中重新保存。')
         for setting, env in [('api_key', 'AI_API_KEY'), ('base_url', 'AI_BASE_URL'), ('model', 'AI_MODEL'),
@@ -69,7 +80,7 @@ class App:
 
     def public_config(self):
         with self.lock:
-            return {**{k: v for k, v in self.config.items() if k in DEFAULTS and k not in SECRET_KEYS},
+            return {**{k: copy.deepcopy(v) for k, v in self.config.items() if k in DEFAULTS and k not in SECRET_KEYS},
                     **{'has_' + k: bool(self.config.get(k)) for k in SECRET_KEYS}}
 
     def save_config(self, data):
@@ -81,6 +92,9 @@ class App:
                 value = data[key]
                 if key == 'custom_sites':
                     config[key] = normalize_custom_sites(value)
+                    continue
+                if key == 'search_engines':
+                    config[key] = normalize_search_engines(value)
                     continue
                 if not isinstance(value, str) or len(value) > 4096 or any(c in value for c in '\r\n\x00'):
                     raise ValueError('配置字段须为单行文本。')
@@ -137,6 +151,7 @@ class App:
                             break
             job_id = uuid.uuid4().hex
             job = {'id': job_id, 'query': query, 'platforms': list(dict.fromkeys(platforms)), 'depth': depth,
+                   'search_engines': [item for item in available_providers(self.config) if item in SEARCH_ENGINE_IDS],
                    'custom_sites': sites, 'adaptive': data.get('adaptive', True) is True,
                    'max_rounds': max_rounds, 'round': 0, 'rounds': [], 'searches_count': 0,
                    'use_ai': data.get('use_ai', True) is True, 'fetch_pages': data.get('fetch_pages', True) is True,
@@ -318,6 +333,7 @@ class App:
                 raise ValueError('检索深度须为 quick、deep 或 research。')
             self.storage.save_job(copy.deepcopy(job))
             job.update(state='queued', stage='adapting', progress=0, adaptive=True, max_rounds=budget, depth=depth,
+                       search_engines=[item for item in available_providers(self.config) if item in SEARCH_ENGINE_IDS],
                        message='准备根据已有线索继续深挖。', resumed_at=datetime.now(timezone.utc).isoformat())
             job.pop('stop_reason', None)
             job.pop('completed_at', None)
@@ -556,13 +572,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, self.app.public_config())
         if path == '/api/health':
             capabilities = self.public_sessions.capabilities() if self.public_sessions else {'public_mode': False, 'session_required': False, 'shared_available': False}
-            return self.respond(200, {'ok': True, 'version': '1.4.0', 'features': ['ai_summary', 'adaptive_search', 'stop_resume', 'custom_sites', 'round_progress_reports', 'direct_longtail_sources', 'research_depth'], **capabilities})
+            return self.respond(200, {'ok': True, 'version': '1.4.0', 'features': ['ai_summary', 'adaptive_search', 'stop_resume', 'custom_sites', 'round_progress_reports', 'direct_longtail_sources', 'research_depth', 'multi_engine_search'], **capabilities})
         if path == '/api/session' and self.public_sessions:
             if self._visitor is None:
                 raise PublicAccessError(403, '管理令牌不属于访客会话，请创建独立访客会话。')
             return self.respond(200, self.public_sessions.describe(self._visitor))
         if path == '/api/platforms':
             return self.respond(200, {'items': platform_catalog(), 'custom_sites': self.app.public_config()['custom_sites']})
+        if path == '/api/search-engines':
+            with self.app.lock:
+                catalog = search_engine_catalog(self.app.config)
+            return self.respond(200, {'items': catalog})
         if path == '/api/library':
             # List metadata only; text is sent to AI only as a relevant search candidate.
             docs = [{k: v for k, v in d.items() if k not in ('text', 'body')} for d in self.app.storage.list_documents()]

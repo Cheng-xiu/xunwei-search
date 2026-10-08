@@ -89,6 +89,23 @@ class ServerTests(unittest.TestCase):
         with urllib.request.urlopen(request) as r:
             return json.load(r)
 
+    def test_search_engine_catalog_and_selection_work_over_http(self):
+        catalog = self.request('/api/search-engines')['items']
+        self.assertTrue({'baidu', 'bing', 'google', 'yandex', 'duckduckgo'}.issubset({item['id'] for item in catalog}))
+        selected = self.request('/api/config', {'search_engines': ['google', 'yandex']}, method='PUT')
+        self.assertEqual(selected['search_engines'], ['google', 'yandex'])
+        self.assertEqual(self.request('/api/config')['search_engines'], ['google', 'yandex'])
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request('/api/config', {'search_engines': ['unknown']}, method='PUT')
+        self.assertEqual(error.exception.code, 400)
+        self.assertEqual(self.request('/api/config')['search_engines'], ['google', 'yandex'])
+
+    def test_search_engine_catalog_does_not_expose_search_credentials(self):
+        self.app.config.update(tavily_key='synthetic-tavily-value', brave_key='synthetic-brave-value')
+        catalog = self.request('/api/search-engines')['items']
+        self.assertNotIn('synthetic-', json.dumps(catalog))
+        self.assertTrue(next(item for item in catalog if item['id'] == 'tavily')['configured'])
+
     def test_secret_never_returned_and_blank_save_preserves(self):
         masked = self.request('/api/config', {'api_key': 'test-private-value'}, 'PUT')
         self.assertTrue(masked['has_api_key'])

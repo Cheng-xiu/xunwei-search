@@ -162,8 +162,8 @@ class ProviderTests(_FakeBilibiliClock):
         self.assertFalse(result["status"]["ok"])
 
     def test_optional_provider_config_aliases(self):
-        self.assertEqual(p.available_providers({}), ["bing", "duckduckgo", "bilibili", "github", "stackoverflow"])
-        self.assertEqual(p.available_providers({"tavily_key": "t", "brave_key": "b", "searxng_url": "https://example.com/"}), ["bing", "duckduckgo", "bilibili", "github", "stackoverflow", "tavily", "brave", "searxng"])
+        self.assertEqual(p.available_providers({}), ["baidu", "bing", "google", "yandex", "duckduckgo", "bilibili", "github", "stackoverflow"])
+        self.assertEqual(p.available_providers({"tavily_key": "t", "brave_key": "b", "searxng_url": "https://example.com/"}), ["baidu", "bing", "google", "yandex", "duckduckgo", "tavily", "brave", "searxng", "bilibili", "github", "stackoverflow"])
 
     def test_native_search_links_use_encoded_query(self):
         links = p.native_search_links("中科大 & 食堂", ["xiaohongshu", "zhihu", "bilibili"])

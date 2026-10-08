@@ -8,6 +8,66 @@
   let apiBase = '', accessToken = '', connected = false, revision = 0, message = '';
   let publicMode = false, visitorSession = false, sharedAvailable = false, sessionMode = '', expiresAt = '', publicLimits = {};
   let catalogPromise;
+  const freeEngineIds = ['baidu', 'bing', 'google', 'yandex', 'duckduckgo'];
+  const engineDefaults = [
+    { id: 'baidu', label: '百度', access: 'public_html', search_url: 'https://www.baidu.com/s?wd={query}' },
+    { id: 'bing', label: '必应 Bing', access: 'public_rss', search_url: 'https://www.bing.com/search?q={query}' },
+    { id: 'google', label: 'Google', access: 'public_html', search_url: 'https://www.google.com/search?q={query}' },
+    { id: 'yandex', label: 'Yandex', access: 'public_html', search_url: 'https://yandex.com/search/?text={query}' },
+    { id: 'duckduckgo', label: 'DuckDuckGo', access: 'public_html', search_url: 'https://duckduckgo.com/?q={query}' },
+    { id: 'tavily', label: 'Tavily', access: 'api', search_url: '' },
+    { id: 'brave', label: 'Brave Search', access: 'api', search_url: 'https://search.brave.com/search?q={query}' },
+    { id: 'searxng', label: 'SearXNG', access: 'api', search_url: '' }
+  ];
+
+  function fallbackEngines() {
+    return { items: engineDefaults.map(item => ({ ...item, requires_key: item.id === 'tavily' || item.id === 'brave', configured: freeEngineIds.includes(item.id), available: freeEngineIds.includes(item.id), description: freeEngineIds.includes(item.id) ? '免费公开网页索引；自动访问可能受限制，浏览器入口可手动打开。' : '需配置自己的搜索 API 或实例后使用。' })), selection_supported: false, offline: !connected };
+  }
+
+  async function searchEngines() {
+    if (!connected) return fallbackEngines();
+    try {
+      const data = await request('/api/search-engines');
+      if (!Array.isArray(data.items) || !data.items.length) return fallbackEngines();
+      const known = new Set(engineDefaults.map(item => item.id));
+      const items = data.items.filter(item => item && known.has(item.id) && typeof item.label === 'string');
+      if (!items.length) return fallbackEngines();
+      return { ...data, items, selection_supported: true };
+    } catch (error) {
+      if (error.code === 'BACKEND_CHANGED' || error.status === 401 || error.status === 403) throw error;
+      return fallbackEngines();
+    }
+  }
+
+  function engineLinks({ query, engines, platforms, selectedPlatforms, customSites = [] }) {
+    const text = String(query || '').trim();
+    if (!text) return [];
+    const scopes = new Map();
+    const selected = new Set(selectedPlatforms || []);
+    const addDomain = (value, label) => {
+      const domain = String(value || '').trim().toLowerCase();
+      if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(domain)) return;
+      if (!scopes.has(domain)) scopes.set(domain, { domain, scope: label || domain, query: `${text} site:${domain}` });
+    };
+    if (selected.has('web')) scopes.set('*', { domain: '', scope: '公开全网', query: text });
+    (platforms || []).forEach(platform => {
+      if (!selected.has(platform.id) || platform.id === 'web') return;
+      (platform.domains || []).forEach(domain => addDomain(domain, `${platform.label || platform.id} · ${domain}`));
+    });
+    customSites.forEach(site => addDomain(site.domain, site.name ? `${site.name} · ${site.domain}` : site.domain));
+    const links = [];
+    (engines || []).forEach(engine => {
+      if (typeof engine.search_url !== 'string' || engine.search_url.split('{query}').length !== 2) return;
+      scopes.forEach(scope => {
+        try {
+          const url = new URL(engine.search_url.replace('{query}', encodeURIComponent(scope.query)));
+          if (url.protocol !== 'https:' || url.username || url.password) return;
+          links.push({ engine: engine.id, label: engine.label, url: url.href, ...scope });
+        } catch (_) { /* Invalid templates are not rendered. */ }
+      });
+    });
+    return links;
+  }
 
   function failure(text, code, status) {
     const error = new Error(text);
@@ -85,7 +145,8 @@
     if (!connected) {
       if ((options.method || 'GET') === 'GET') {
         if (path === '/api/platforms') return catalog();
-        if (path === '/api/config') return { base_url: '', model: '', searxng_url: '', custom_sites: [], has_api_key: false, has_tavily_key: false, has_brave_key: false, shared_available: false, offline: true };
+        if (path === '/api/config') return { base_url: '', model: '', searxng_url: '', custom_sites: [], search_engines: [], has_api_key: false, has_tavily_key: false, has_brave_key: false, shared_available: false, offline: true };
+        if (path === '/api/search-engines') return fallbackEngines();
         if (path === '/api/history' || path === '/api/library') return { items: [], offline: true };
       }
       throw failure('请先连接搜索服务，再使用智能搜索、历史记录或资料库。', 'BACKEND_REQUIRED');
@@ -202,7 +263,7 @@
     return snapshot();
   }
 
-  window.XunweiConnection = Object.freeze({ mode, snapshot, normalizeBase, request, catalog, connect, disconnect, initialize, setModelMode,
+  window.XunweiConnection = Object.freeze({ mode, snapshot, normalizeBase, request, catalog, searchEngines, engineLinks, connect, disconnect, initialize, setModelMode,
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); }
   });
 })();

@@ -6,6 +6,7 @@ are reported, never bypassed. This module uses the Python standard library.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import base64
 import datetime as dt
 import html
 from html.parser import HTMLParser
@@ -51,6 +52,16 @@ PLATFORM_HOSTS = {
 }
 PLATFORM_LABELS = {"bilibili": "哔哩哔哩", "xiaohongshu": "小红书", "zhihu": "知乎", "wechat": "微信公众号", "meituan": "美团", "dianping": "大众点评", "douyin": "抖音", "tieba": "百度贴吧", "douban": "豆瓣", "github": "GitHub", "stackoverflow": "Stack Overflow", "v2ex": "V2EX", "csdn": "CSDN", "cnblogs": "博客园", "reddit": "Reddit", "web": "全网"}
 _TRACKING_KEYS = {"spm_id_from", "vd_source", "share_source", "share_medium", "share_plat", "share_session_id", "from_source", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"}
+SEARCH_ENGINE_IDS = ("baidu", "bing", "google", "yandex", "duckduckgo", "tavily", "brave", "searxng")
+_ENGINE_LABELS = {"baidu": "百度", "bing": "必应", "google": "Google", "yandex": "Yandex", "duckduckgo": "DuckDuckGo", "tavily": "Tavily", "brave": "Brave Search", "searxng": "SearXNG"}
+_ENGINE_SEARCH_URLS = {
+    "baidu": "https://www.baidu.com/s?wd={query}",
+    "bing": "https://www.bing.com/search?q={query}",
+    "google": "https://www.google.com/search?q={query}",
+    "yandex": "https://yandex.com/search/?text={query}",
+    "duckduckgo": "https://duckduckgo.com/?q={query}",
+    "brave": "https://search.brave.com/search?q={query}",
+}
 
 
 class PublicFetchError(Exception):
@@ -414,15 +425,50 @@ def _setting(config, *keys):
     return ""
 
 
+def search_engine_catalog(config=None) -> list[dict]:
+    """Search engines are discovery sources, separate from content platforms."""
+    config = config if isinstance(config, dict) else {}
+    configured = {"tavily": bool(_setting(config, "tavily_key", "tavily_api_key")),
+                  "brave": bool(_setting(config, "brave_key", "brave_api_key")),
+                  "searxng": bool(_setting(config, "searxng_url"))}
+    catalog = []
+    for engine in SEARCH_ENGINE_IDS:
+        template = _ENGINE_SEARCH_URLS.get(engine, "")
+        if engine == "searxng":
+            base = canonical_url(_setting(config, "searxng_url"))
+            if base and urllib.parse.urlsplit(base).scheme == "https":
+                parts = urllib.parse.urlsplit(base)
+                path = parts.path.rstrip("/")
+                if not path.endswith("/search"):
+                    path += "/search"
+                template = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "q={query}", ""))
+        access = "api" if engine in ("tavily", "brave", "searxng") else ("public_rss" if engine == "bing" else "public_html")
+        description = ("需配置搜索 API；仅返回接口实际结果" if engine in ("tavily", "brave") else
+                       "需配置允许访问的 SearXNG 实例并启用 JSON 输出" if engine == "searxng" else
+                       "公开 RSS 搜索结果；覆盖和相关性由来源决定" if engine == "bing" else
+                       "公开网页搜索，非官方 API；可能因验证码、页面变化或网络限制而无法自动读取")
+        catalog.append({"id": engine, "label": _ENGINE_LABELS[engine], "access": access,
+                        "requires_key": engine in ("tavily", "brave"),
+                        "configured": configured.get(engine, True), "available": configured.get(engine, True), "search_url": template,
+                        "description": description})
+    return catalog
+
+
+def search_engine_links(query: str, engines=None, config=None) -> list[dict]:
+    if not isinstance(query, str) or not query.strip():
+        return []
+    selected = engines if isinstance(engines, list) and engines else SEARCH_ENGINE_IDS
+    encoded = urllib.parse.quote(query.strip()[:1000], safe="")
+    return [{"engine": item["id"], "label": item["label"] + "搜索", "url": item["search_url"].replace("{query}", encoded)}
+            for item in search_engine_catalog(config) if item["id"] in selected and item["search_url"]]
+
+
 def available_providers(config: dict) -> list[str]:
-    result = ["bing", "duckduckgo", "bilibili", "github", "stackoverflow"]
-    if _setting(config, "tavily_key", "tavily_api_key"):
-        result.append("tavily")
-    if _setting(config, "brave_key", "brave_api_key"):
-        result.append("brave")
-    if _setting(config, "searxng_url"):
-        result.append("searxng")
-    return result
+    config = config if isinstance(config, dict) else {}
+    chosen = config.get("search_engines")
+    selected = chosen if isinstance(chosen, list) and chosen else SEARCH_ENGINE_IDS
+    generic = [item["id"] for item in search_engine_catalog(config) if item["id"] in selected and item["configured"]]
+    return generic + ["bilibili", "github", "stackoverflow"]
 
 
 def _platforms(platforms):
@@ -442,7 +488,7 @@ def _normalize_results(rows, platforms, provider, limit):
     seen = set()
     output = []
     for row in rows:
-        url = canonical_url(row.get("url", ""))
+        url = _unwrap_search_url(row.get("url", "")) if provider in SEARCH_ENGINE_IDS else canonical_url(row.get("url", ""))
         if not url or url in seen:
             continue
         platform = platform_of(url)
@@ -453,6 +499,8 @@ def _normalize_results(rows, platforms, provider, limit):
             continue
         seen.add(url)
         item = {"title": title, "url": url, "snippet": _clean(row.get("snippet", "")), "platform": platform, "source": provider}
+        if provider in SEARCH_ENGINE_IDS:
+            item["engine"] = provider
         if isinstance(row.get("views"), int) and not isinstance(row.get("views"), bool) and row["views"] >= 0:
             item["views"] = row["views"]
         if row.get("published"):
@@ -469,6 +517,344 @@ def _normalize_results(rows, platforms, provider, limit):
         if len(output) >= limit:
             break
     return output
+
+
+_SEARCH_HOSTS = {"baidu.com", "www.baidu.com", "m.baidu.com", "wappass.baidu.com",
+                 "bing.com", "www.bing.com", "cn.bing.com", "google.com", "www.google.com",
+                 "google.co.uk", "www.google.co.uk", "google.com.hk", "www.google.com.hk",
+                 "accounts.google.com", "consent.google.com", "yandex.com", "www.yandex.com",
+                 "yandex.ru", "www.yandex.ru", "duckduckgo.com", "www.duckduckgo.com",
+                 "html.duckduckgo.com", "search.brave.com"}
+
+
+def _unwrap_search_url(value, base=""):
+    """Unwrap known query wrappers without executing scripts or opening links."""
+    if not isinstance(value, str) or len(value) > 16000:
+        return ""
+    value = html.unescape(value).strip()
+    if base:
+        value = urllib.parse.urljoin(base, value)
+    for _ in range(4):
+        normalized = canonical_url(value)
+        if not normalized:
+            return ""
+        parts = urllib.parse.urlsplit(normalized)
+        host = parts.hostname or ""
+        if any(_host_matches(host, domain) for domain in ("googleadservices.com", "doubleclick.net", "cpro.baidu.com")):
+            return ""
+        if host not in _SEARCH_HOSTS:
+            return normalized
+        query = urllib.parse.parse_qs(parts.query)
+        destination = ""
+        if host in ("google.com", "www.google.com", "google.co.uk", "www.google.co.uk", "google.com.hk", "www.google.com.hk") and parts.path == "/url":
+            destination = query.get("q", query.get("url", [""]))[0]
+        elif host in ("bing.com", "www.bing.com", "cn.bing.com") and parts.path.rstrip("/") == "/ck/a":
+            destination = query.get("u", [""])[0]
+            if destination.startswith("a1"):
+                try:
+                    encoded = destination[2:]
+                    destination = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True).decode("utf-8")
+                except (ValueError, UnicodeError):
+                    return ""
+        elif host in ("duckduckgo.com", "www.duckduckgo.com", "html.duckduckgo.com") and parts.path in ("/l", "/l/"):
+            destination = query.get("uddg", [""])[0]
+        elif host in ("yandex.com", "www.yandex.com", "yandex.ru", "www.yandex.ru") and parts.path.startswith(("/clck/", "/redir")):
+            destination = query.get("url", query.get("u", [""]))[0]
+        elif host in ("baidu.com", "www.baidu.com") and parts.path in ("/link", "/ulink"):
+            destination = query.get("url", [""])[0]
+        if not destination or not destination.startswith(("https://", "http://")):
+            return ""
+        value = destination
+    return ""
+
+
+class _SearchNode:
+    __slots__ = ("tag", "attrs", "parent", "children")
+
+    def __init__(self, tag, attrs, parent=None):
+        self.tag, self.attrs, self.parent, self.children = tag, dict(attrs), parent, []
+
+
+class _SearchHTML(HTMLParser):
+    """A bounded tree preserves title/link/snippet membership in result cards."""
+    VOID = frozenset(("area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"))
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _SearchNode("root", [])
+        self.stack = [self.root]
+        self.count = 0
+
+    def handle_starttag(self, tag, attrs):
+        self.count += 1
+        if self.count > 40000 or len(self.stack) > 200:
+            raise PublicFetchError("搜索页面结构过大或嵌套过深，已停止解析")
+        node = _SearchNode(tag, attrs, self.stack[-1])
+        self.stack[-1].children.append(node)
+        if tag not in self.VOID:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self.VOID:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index].tag == tag:
+                del self.stack[index:]
+                break
+
+    def handle_data(self, data):
+        self.stack[-1].children.append(data)
+
+
+def _search_nodes(node):
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, _SearchNode):
+            continue
+        yield current
+        pending.extend(reversed(current.children))
+
+
+def _search_node_excluded(node):
+    if node.tag in ("script", "style", "nav", "footer", "form", "template", "noscript"):
+        return True
+    if "hidden" in node.attrs or str(node.attrs.get("aria-hidden", "")).strip().lower() == "true":
+        return True
+    style = re.sub(r"/\*.*?\*/", "", str(node.attrs.get("style", "")), flags=re.S)
+    return bool(re.search(r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|content-visibility\s*:\s*hidden)\s*(?:!\s*important\s*)?(?:;|$)", style, re.I))
+
+
+def _search_excluded_ancestor(node):
+    while node is not None:
+        if _search_node_excluded(node):
+            return True
+        node = node.parent
+    return False
+
+
+def _search_text(node, limit=3000):
+    pending, pieces, length = [node], [], 0
+    while pending and length < limit:
+        current = pending.pop()
+        if isinstance(current, str):
+            pieces.append(current)
+            length += len(current)
+        elif not _search_node_excluded(current):
+            pending.extend(reversed(current.children))
+    return re.sub(r"\s+", " ", "".join(pieces)).strip()[:limit]
+
+
+def _node_classes(node):
+    return set((node.attrs.get("class") or "").split())
+
+
+def _ad_node(node):
+    classes = _node_classes(node)
+    return (bool(classes.intersection({"ad", "ads", "advertisement", "uEierd", "ec-tuiguang", "ec_result", "c-container-ad", "serp-item_type_ad", "serp-item_type_adv"}))
+            or node.attrs.get("id") in ("tads", "tadsb", "bottomads", "ads")
+            or "data-text-ad" in node.attrs or "data-ad" in node.attrs)
+
+
+def _search_challenge(parser, final_url):
+    parts = urllib.parse.urlsplit(final_url)
+    if re.search(r"/(?:sorry|showcaptcha|captcha|antispider|login|signin)(?:/|$)", parts.path, re.I) or parts.hostname in ("consent.google.com", "accounts.google.com", "wappass.baidu.com"):
+        return True
+    for node in _search_nodes(parser.root):
+        if node.tag == "title":
+            title = _search_text(node, 500).strip().lower()
+            if title in ("百度安全验证", "安全验证", "人机验证", "are you not a robot?", "are you a robot?", "robot check", "just a moment...") or title.startswith(("google - sorry", "sorry - google")):
+                return True
+        if node.tag == "form" and ((node.attrs.get("id") or "").lower() in ("captcha-form", "challenge-form", "challenge") or re.search(r"/(?:showcaptcha|sorry|captcha)(?:/|\?|$)", node.attrs.get("action") or "", re.I)):
+            return True
+        if node.tag in ("div", "iframe") and ((node.attrs.get("id") or "").lower() in ("recaptcha", "captcha") or "g-recaptcha" in _node_classes(node)):
+            return True
+    return False
+
+
+def _search_card(node, engine):
+    current = node.parent
+    while current is not None:
+        classes = _node_classes(current)
+        if engine == "baidu" and (classes.intersection(("result", "result-op")) or "c-container" in classes and str(current.attrs.get("id", "")).isdigit()):
+            return current
+        if engine == "google" and classes.intersection(("g", "MjjYud", "tF2Cxc", "Gx5Zad", "ezO2md")):
+            return current
+        if engine == "yandex" and classes.intersection(("serp-item", "Organic", "organic")):
+            return current
+        current = current.parent
+    return None
+
+
+def _search_html_rows(parser, engine, final_url):
+    snippets = {"baidu": {"c-abstract", "c-span-last", "c-font-normal", "content-right"},
+                "google": {"VwiC3b", "aCOpRe", "IsZvec", "st", "s3v9rd", "yXK7lf"},
+                "yandex": {"OrganicTextContentSpan", "OrganicTextContent", "organic__text", "text-container"}}
+    rows, seen_cards = [], set()
+    for heading in _search_nodes(parser.root):
+        if heading.tag not in (("h2", "h3") if engine == "yandex" else ("h3",)):
+            continue
+        if _search_excluded_ancestor(heading):
+            continue
+        card = _search_card(heading, engine)
+        if card is None or id(card) in seen_cards:
+            continue
+        current, ad = card, False
+        while current is not None:
+            ad = ad or _ad_node(current)
+            current = current.parent
+        if ad or any(_ad_node(child) for child in _search_nodes(card)):
+            continue
+        link = next((child for child in _search_nodes(heading) if child.tag == "a" and child.attrs.get("href") and not _search_excluded_ancestor(child)), None)
+        current = heading.parent
+        while link is None and current is not None:
+            if current.tag == "a" and current.attrs.get("href"):
+                link = current
+                break
+            if current is card:
+                break
+            current = current.parent
+        if link is None:
+            continue
+        title = _search_text(heading, 500)
+        if not title:
+            continue
+        seen_cards.add(id(card))
+        raw_url = urllib.parse.urljoin(final_url, link.attrs.get("href", ""))
+        raw_parts = urllib.parse.urlsplit(canonical_url(raw_url))
+        if any(_host_matches(raw_parts.hostname or "", domain) for domain in ("googleadservices.com", "doubleclick.net", "cpro.baidu.com")) or raw_parts.path in ("/baidu.php", "/aclick"):
+            continue
+        destination = _unwrap_search_url(raw_url)
+        if not destination and engine == "baidu":
+            # Only complete embedded target URLs count, never an abbreviated
+            # display domain or a breadcrumb that would require guessing paths.
+            for node in (link, card):
+                candidates = [node.attrs.get(key, "") for key in ("mu", "data-landurl", "data-url")]
+                for key in ("data-tools", "data-log"):
+                    try:
+                        embedded = json.loads(node.attrs.get(key) or "{}")
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(embedded, dict):
+                        candidates.extend(embedded.get(key, "") for key in ("url", "mu"))
+                destination = next((url for value in candidates if (url := _unwrap_search_url(value))), "")
+                if destination:
+                    break
+        snippet = ""
+        for child in _search_nodes(card):
+            if _node_classes(child).intersection(snippets[engine]) and not _search_excluded_ancestor(child):
+                snippet = _search_text(child)
+                if snippet:
+                    break
+        row = {"title": title, "url": destination, "snippet": snippet}
+        if not destination and engine == "baidu":
+            parts = urllib.parse.urlsplit(canonical_url(raw_url))
+            if parts.hostname in ("www.baidu.com", "baidu.com") and parts.path in ("/link", "/ulink"):
+                row["_baidu_link"] = raw_url
+        if destination or row.get("_baidu_link"):
+            rows.append(row)
+    return rows
+
+
+class _SearchDestination(Exception):
+    def __init__(self, url):
+        self.url = url
+
+
+def _baidu_target(url, event):
+    """Stop at an external Location; never fetch result bodies to unwrap links."""
+    def redirect_guard(target):
+        _check_cancel_event(event)
+        destination = _unwrap_search_url(target)
+        if destination:
+            raise _SearchDestination(destination)
+        parts = urllib.parse.urlsplit(target)
+        if parts.hostname not in ("baidu.com", "www.baidu.com") or parts.path not in ("/link", "/ulink"):
+            raise PublicFetchError("百度结果跳转需要验证或没有可核实目标，已跳过")
+        raise PublicFetchError("百度结果仍指向不透明跳转，已停止继续跳转解析")
+    try:
+        payload, headers, final_url, _ = _request(url, max_bytes=32000, redirect_guard=redirect_guard, cancel_event=event)
+    except _SearchDestination as found:
+        return found.url
+    parser = _SearchHTML()
+    parser.feed(_decode(payload, headers))
+    if _search_challenge(parser, final_url):
+        raise PublicFetchError("百度结果跳转返回人机验证，未继续请求")
+    for node in _search_nodes(parser.root):
+        if node.tag == "meta" and str(node.attrs.get("http-equiv", "")).lower() == "refresh":
+            match = re.fullmatch(r"\s*\d+(?:\.\d+)?\s*;\s*url\s*=\s*['\"]?(https?://[^'\"\s]+)['\"]?\s*", node.attrs.get("content", ""), re.I)
+            if match:
+                return _unwrap_search_url(match.group(1))
+    return ""
+
+
+def _public_search_html(engine, query, limit, config):
+    event, gate = config.get("_cancel_event"), _SEARCH_HTML_GATES[engine]
+    template = _ENGINE_SEARCH_URLS[engine]
+    url = template.replace("{query}", urllib.parse.quote(query, safe=""))
+    with gate.slot(event):
+        try:
+            payload, headers, final_url, _ = _request(url, headers={"Accept": "text/html,application/xhtml+xml"}, cancel_event=event)
+            _check_cancel_event(event)
+            parser = _SearchHTML()
+            parser.feed(_decode(payload, headers))
+            if _search_challenge(parser, final_url):
+                gate.cooldown(60)
+                raise PublicFetchError(_ENGINE_LABELS[engine] + " 返回人机验证或登录页面，未绕过；可打开浏览器搜索入口或选择其他来源")
+            allowed_hosts = {"baidu": ("baidu.com", "www.baidu.com"),
+                             "google": ("google.com", "www.google.com", "google.co.uk", "www.google.co.uk", "google.com.hk", "www.google.com.hk"),
+                             "yandex": ("yandex.com", "www.yandex.com", "yandex.ru", "www.yandex.ru")}
+            if urllib.parse.urlsplit(final_url).hostname not in allowed_hosts[engine]:
+                raise PublicFetchError(_ENGINE_LABELS[engine] + " 跳转到了其他来源，未把第三方页面当作该引擎结果")
+            rows = _search_html_rows(parser, engine, final_url)
+            if not rows and not re.search(r"did not match any documents|no results found|no results were found|没有找到|未找到相关|抱歉[^。]{0,40}没有|ничего не найдено|по вашему запросу ничего", _search_text(parser.root, 12000), re.I):
+                raise PublicFetchError(_ENGINE_LABELS[engine] + " 未返回可识别的公开搜索结果；可能需要 JavaScript、访问受限或页面结构已改变")
+            output = _ProviderRows()
+            attempts, unresolved, resolving = 0, 0, True
+            for row in rows:
+                _check_cancel_event(event)
+                if not row["url"] and row.get("_baidu_link"):
+                    if resolving and attempts < 2:
+                        attempts += 1
+                        try:
+                            row["url"] = _baidu_target(row["_baidu_link"], event)
+                        except SearchCancelled:
+                            raise
+                        except PublicFetchError as exc:
+                            if exc.http_status in (403, 412, 429) or "验证" in str(exc):
+                                gate.cooldown(60)
+                                resolving = False
+                    if not row["url"]:
+                        unresolved += 1
+                        continue
+                output.append({key: value for key, value in row.items() if not key.startswith("_")})
+                if len(output) >= limit:
+                    break
+            output.coverage = _ENGINE_LABELS[engine] + " 公开网页搜索第 1 页及来源摘要（非官方 API）"
+            if engine == "baidu":
+                output.coverage += f"；额外核实 {attempts} 次结果跳转（最多 2 次，不读取目标正文）"
+            if unresolved:
+                output.warning = f"{unresolved} 条结果未能核实目标 URL，已跳过；没有用显示域名推测帖子链接"
+            return output
+        except PublicFetchError as exc:
+            if exc.http_status in (403, 412, 429):
+                gate.cooldown(60)
+            raise
+
+
+def _baidu(query, limit, config):
+    return _public_search_html("baidu", query, limit, config)
+
+
+def _google(query, limit, config):
+    return _public_search_html("google", query, limit, config)
+
+
+def _yandex(query, limit, config):
+    return _public_search_html("yandex", query, limit, config)
 
 
 def _bing(query, limit, config):
@@ -583,7 +969,7 @@ class _SourceGate:
             now = time.monotonic()
             if now < self.cooldown_until:
                 remaining = max(1, int(self.cooldown_until - now + 0.999))
-                raise PublicFetchError(f"{self.label} 公开 API 冷却中（约 {remaining} 秒），本次未继续请求")
+                raise PublicFetchError(f"{self.label} 来源冷却中（约 {remaining} 秒），本次未继续请求")
             delay = self.next_request_at - now
             if delay > 0:
                 if event is None:
@@ -600,6 +986,7 @@ class _SourceGate:
 
 _GITHUB_GATE = _SourceGate("GitHub", 6.2)
 _STACKOVERFLOW_GATE = _SourceGate("Stack Overflow", 1.0)
+_SEARCH_HTML_GATES = {engine: _SourceGate(_ENGINE_LABELS[engine], 1.5) for engine in ("baidu", "google", "yandex")}
 
 
 def _numeric(value, default=0):
@@ -902,7 +1289,7 @@ def _searxng(query, limit, config):
 def search_provider(provider: str, query: str, platforms: list[str], limit: int, config: dict) -> dict:
     config = config if isinstance(config, dict) else {}
     status = {"provider": provider, "ok": False, "count": 0}
-    implementations = {"bing": _bing, "duckduckgo": _duckduckgo, "bilibili": _bilibili, "github": _github, "stackoverflow": _stackoverflow, "tavily": _tavily, "brave": _brave, "searxng": _searxng}
+    implementations = {"baidu": _baidu, "bing": _bing, "google": _google, "yandex": _yandex, "duckduckgo": _duckduckgo, "bilibili": _bilibili, "github": _github, "stackoverflow": _stackoverflow, "tavily": _tavily, "brave": _brave, "searxng": _searxng}
     try:
         _check_cancel_event(config.get("_cancel_event"))
         if provider not in implementations:
@@ -1128,7 +1515,7 @@ def search_custom_site(site: dict, query: str, limit: int, config: dict) -> dict
         query, limit = query.strip()[:1000], max(1, min(int(limit), 50))
         if not normalized["search_url"]:
             engine = config.get("_engine", "bing")
-            if engine not in ("bing", "duckduckgo", "tavily", "brave", "searxng"):
+            if engine not in SEARCH_ENGINE_IDS:
                 raise PublicFetchError("自定义网站公开索引须选择通用搜索来源")
             response = search_provider(engine, query + " site:" + domain, ["web"], limit, config)
             status.update(response["status"], provider="website", engine=engine, site=name, domain=domain,
@@ -1169,6 +1556,8 @@ def search_custom_site(site: dict, query: str, limit: int, config: dict) -> dict
         results = _normalize_results(rows, ["web"], "website", limit)
         for row in results:
             row.update(platform="website", site=name, domain=domain)
+            if status.get("engine"):
+                row["engine"] = status["engine"]
         status["count"] = len(results)
         if not results and status.get("ok"):
             status["message"] = "该网站本轮没有可用公开结果；不代表站内不存在相关内容"

@@ -158,7 +158,10 @@ class ReportLifecycleTests(unittest.TestCase):
         ])
         updates = []
         response = {'results': [], 'status': {'provider': 'test', 'ok': True}}
-        with patch('search_app.engine.build_tasks', return_value=[('bing', job['query'] + ' site:zhihu.com', ['zhihu'])]), \
+        with patch('search_app.engine.build_tasks', return_value=[
+                 ('bing', job['query'] + ' site:zhihu.com', ['zhihu']),
+                 ('bing', job['query'], ['website:example.org']),
+                 ('website', job['query'], ['website:example.com'])]), \
              patch('search_app.engine.search_provider', return_value=response), \
              patch('search_app.engine.search_custom_site', return_value=response), \
              patch('search_app.engine.build_progress_report', return_value=None):
