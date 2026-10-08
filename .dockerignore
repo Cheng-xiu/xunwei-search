@@ -1,0 +1,16 @@
+.git/
+.github/
+.local/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+.env.*
+backend.env
+work/
+tests/
+docs/
+test-artifacts/
+*.zip
+*.sqlite*
+settings.json

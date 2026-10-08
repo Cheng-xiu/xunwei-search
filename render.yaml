@@ -1,0 +1,37 @@
+# Public, free-tier backend for the GitHub Pages frontend.
+# Secrets belong in the Render Dashboard, never in this file.
+services:
+  - type: web
+    name: xunwei-search-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    # This site's owner requested push-to-update deployment. Fork operators can
+    # turn automatic deploys off in Render if they prefer manual updates.
+    autoDeployTrigger: commit
+    envVars:
+      - key: XUNWEI_HOST
+        value: 0.0.0.0
+      - key: XUNWEI_PUBLIC_MODE
+        value: '1'
+      - key: XUNWEI_DATA_DIR
+        value: /data
+      - key: XUNWEI_ALLOWED_ORIGINS
+        value: https://cheng-xiu.github.io
+      - key: XUNWEI_PUBLIC_HOSTS
+        fromService:
+          type: web
+          name: xunwei-search-api
+          envVarKey: RENDER_EXTERNAL_HOSTNAME
+      - key: XUNWEI_ACCESS_TOKEN
+        generateValue: true
+      - key: AI_BASE_URL
+        value: https://api.a6api.com/v1
+      - key: AI_MODEL
+        value: deepseek-v4.1-flash
+    # No disk or database is created. Free services have ephemeral storage.
+    # Optional owner-funded AI: add AI_API_KEY in Render Environment after deploy.
+    # Visitors can supply their own model settings without a shared owner key.

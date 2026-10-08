@@ -1,0 +1,9 @@
+{
+  "base_url": "https://api.a6api.com/v1",
+  "model": "deepseek-v4.1-flash",
+  "api_key": "",
+  "tavily_key": "",
+  "brave_key": "",
+  "searxng_url": "",
+  "custom_sites": []
+}

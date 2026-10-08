@@ -1,0 +1,181 @@
+{
+  "items": [
+    {
+      "id": "bilibili",
+      "label": "哔哩哔哩",
+      "domains": [
+        "bilibili.com",
+        "b23.tv"
+      ],
+      "access": "public_api",
+      "description": "公开视频搜索接口及公开索引；接口可能限流，不覆盖全部动态、专栏或评论。",
+      "search_url": "https://search.bilibili.com/all?keyword={query}",
+      "search_label": "哔哩哔哩站内搜索"
+    },
+    {
+      "id": "xiaohongshu",
+      "label": "小红书",
+      "domains": [
+        "xiaohongshu.com",
+        "xhslink.com"
+      ],
+      "access": "public_index",
+      "description": "检索公开网页索引并提供站内入口；不使用登录后接口，不绕过访问限制。",
+      "search_url": "https://www.xiaohongshu.com/search_result?keyword={query}&source=web_search_result_notes",
+      "search_label": "小红书站内搜索"
+    },
+    {
+      "id": "zhihu",
+      "label": "知乎",
+      "domains": [
+        "zhihu.com"
+      ],
+      "access": "public_index",
+      "description": "检索公开网页索引并提供站内入口；不使用登录后接口，不绕过访问限制。",
+      "search_url": "https://www.zhihu.com/search?type=content&q={query}",
+      "search_label": "知乎站内搜索"
+    },
+    {
+      "id": "wechat",
+      "label": "微信公众号",
+      "domains": [
+        "mp.weixin.qq.com"
+      ],
+      "access": "public_index",
+      "description": "仅检索 mp.weixin.qq.com 公开文章索引；搜狗文章入口需在浏览器打开，不接入登录后微信搜索。",
+      "search_url": "https://weixin.sogou.com/weixin?type=2&query={query}",
+      "search_label": "公众号文章搜索（搜狗）"
+    },
+    {
+      "id": "meituan",
+      "label": "美团",
+      "domains": [
+        "meituan.com"
+      ],
+      "access": "public_index",
+      "description": "检索美团公开网页索引；无已验证的通用站内搜索接口，不抓取登录后商户或评论数据。",
+      "search_url": "https://www.bing.com/search?q={query}+site%3Ameituan.com",
+      "search_label": "美团公开索引"
+    },
+    {
+      "id": "dianping",
+      "label": "大众点评",
+      "domains": [
+        "dianping.com"
+      ],
+      "access": "public_index",
+      "description": "检索大众点评公开网页索引；城市与登录限制可能影响访问，不接入认证接口。",
+      "search_url": "https://www.bing.com/search?q={query}+site%3Adianping.com",
+      "search_label": "大众点评公开索引"
+    },
+    {
+      "id": "douyin",
+      "label": "抖音",
+      "domains": [
+        "douyin.com",
+        "iesdouyin.com"
+      ],
+      "access": "public_index",
+      "description": "检索抖音公开网页索引；站内入口可能依赖浏览器、登录或验证，不自动绕过。",
+      "search_url": "https://www.douyin.com/search/{query}",
+      "search_label": "抖音站内搜索"
+    },
+    {
+      "id": "tieba",
+      "label": "百度贴吧",
+      "domains": [
+        "tieba.baidu.com"
+      ],
+      "access": "public_index",
+      "description": "检索百度贴吧公开网页索引；站内搜索入口可能限制自动访问。",
+      "search_url": "https://tieba.baidu.com/f/search/res?ie=utf-8&qw={query}",
+      "search_label": "百度贴吧站内搜索"
+    },
+    {
+      "id": "douban",
+      "label": "豆瓣",
+      "domains": [
+        "douban.com"
+      ],
+      "access": "public_index",
+      "description": "检索豆瓣公开网页索引，并提供浏览器站内搜索入口。",
+      "search_url": "https://www.douban.com/search?q={query}",
+      "search_label": "豆瓣站内搜索"
+    },
+    {
+      "id": "github",
+      "label": "GitHub",
+      "domains": [
+        "github.com"
+      ],
+      "access": "public_api",
+      "description": "匿名公开 API 搜索 issues、PR 和仓库；可读取帖子首楼正文，不包含评论、私有仓库或需授权的代码搜索。",
+      "search_url": "https://github.com/search?q={query}&type=issues",
+      "search_label": "GitHub站内搜索"
+    },
+    {
+      "id": "stackoverflow",
+      "label": "Stack Overflow",
+      "domains": [
+        "stackoverflow.com"
+      ],
+      "access": "public_api",
+      "description": "StackExchange 公开 API 搜索 Stack Overflow 问题，含问题正文与实际浏览量；不包含未返回的回答或评论。",
+      "search_url": "https://stackoverflow.com/search?q={query}",
+      "search_label": "Stack Overflow站内搜索"
+    },
+    {
+      "id": "v2ex",
+      "label": "V2EX",
+      "domains": [
+        "v2ex.com"
+      ],
+      "access": "public_index",
+      "description": "通过搜索引擎检索 V2EX 公开主题索引；没有接入历史主题全文搜索 API。",
+      "search_url": "https://www.bing.com/search?q={query}+site%3Av2ex.com",
+      "search_label": "V2EX 公开索引"
+    },
+    {
+      "id": "csdn",
+      "label": "CSDN",
+      "domains": [
+        "csdn.net"
+      ],
+      "access": "public_index",
+      "description": "通过搜索引擎检索 CSDN 公开文章索引；不接入登录或付费全文。",
+      "search_url": "https://www.bing.com/search?q={query}+site%3Acsdn.net",
+      "search_label": "CSDN 公开索引"
+    },
+    {
+      "id": "cnblogs",
+      "label": "博客园",
+      "domains": [
+        "cnblogs.com"
+      ],
+      "access": "public_index",
+      "description": "通过搜索引擎检索博客园公开文章索引；站内搜索可能要求人机验证。",
+      "search_url": "https://www.bing.com/search?q={query}+site%3Acnblogs.com",
+      "search_label": "博客园公开索引"
+    },
+    {
+      "id": "reddit",
+      "label": "Reddit",
+      "domains": [
+        "reddit.com"
+      ],
+      "access": "public_index",
+      "description": "通过搜索引擎检索 Reddit 公开帖子索引；未接入需要授权或拒绝匿名访问的 API。",
+      "search_url": "https://www.bing.com/search?q={query}+site%3Areddit.com",
+      "search_label": "Reddit 公开索引"
+    },
+    {
+      "id": "web",
+      "label": "全网",
+      "domains": [],
+      "access": "public_index",
+      "description": "通过配置的搜索来源检索公开全网索引；不能保证覆盖未收录、私密或需登录内容。",
+      "search_url": "https://www.bing.com/search?q={query}",
+      "search_label": "Bing 全网搜索"
+    }
+  ]
+}

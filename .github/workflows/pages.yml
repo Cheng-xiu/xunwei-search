@@ -1,0 +1,82 @@
+name: Deploy public frontend to GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      # Versions verified against the official actions/* release APIs.
+      - name: Check out project
+        uses: actions/checkout@v7.0.1
+      - name: Run offline Python regressions
+        run: |
+          python - <<'PY'
+          import ipaddress
+          import sys
+          import unittest
+
+          def offline(event, args):
+              if event not in ('socket.connect', 'socket.getaddrinfo'):
+                  return
+              address = args[1] if event == 'socket.connect' else args[0]
+              host = address[0] if isinstance(address, tuple) else address
+              if host in (None, 'localhost'):
+                  return
+              try:
+                  if ipaddress.ip_address(host).is_loopback:
+                      return
+              except ValueError:
+                  pass
+              raise OSError('External network is disabled in Pages regression tests')
+
+          sys.addaudithook(offline)
+          suite = unittest.defaultTestLoader.discover('tests')
+          raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
+          PY
+      - name: Check frontend JavaScript syntax
+        run: |
+          node --check web/app.js
+          node --check web/connection.js
+          node --check web/deployment-config.js
+      - name: Test backend connection handling offline
+        run: node --test tests/test_connection.mjs
+      - name: Configure Pages
+        uses: actions/configure-pages@v6.0.0
+      - name: Build static allowlist
+        env:
+          # This repository variable is a PUBLIC HTTPS service URL, not a key.
+          # Leave unset to let each visitor configure their own backend.
+          XUNWEI_PAGES_API_BASE: ${{ vars.XUNWEI_PAGES_API_BASE }}
+        run: python scripts/build_pages.py
+      - name: Upload only generated frontend
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@v5.0.1
