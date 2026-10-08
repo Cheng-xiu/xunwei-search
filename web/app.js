@@ -19,6 +19,7 @@
   let engineSelectionSupported = false;
   let engineDraftIds = null;
   const engineNames = { baidu: '百度', bing: '必应 Bing', google: 'Google', yandex: 'Yandex', duckduckgo: 'DuckDuckGo', tavily: 'Tavily', brave: 'Brave Search', searxng: 'SearXNG' };
+  const actionNames = { search: '搜索公开线索', search_site: '搜索指定网站', search_videos: '搜索视频', inspect: '读取入口', read_replies: '读取公开回复' };
   const tasks = new Map();
   let taskEpoch = 0;
   let submissionBusy = false;
@@ -225,7 +226,7 @@
     serverTaskLimit = 0;
     taskListing = false;
     state.pollToken += 1;
-    Object.assign(state, { config: null, job: null, activeJobId: '', stopRequested: false, lastResults: '', lastAISummary: '', lastRounds: '', summaryPending: false, summaryError: '', history: [], library: [], sitesDirty: false, filter: 'all', views: 'all' });
+    Object.assign(state, { config: null, job: null, activeJobId: '', stopRequested: false, lastResults: '', lastAISummary: '', lastRounds: '', lastNavigation: '', summaryPending: false, summaryError: '', history: [], library: [], sitesDirty: false, filter: 'all', views: 'all' });
     resetProgressReport();
     renderSiteRows([]);
     setBusy(false);
@@ -241,6 +242,9 @@
     $$('[data-filter]').forEach(button => { button.classList.toggle('active', button.dataset.filter === 'all'); button.setAttribute('aria-pressed', String(button.dataset.filter === 'all')); });
     ['export-results','result-tools','answer-summary','ai-summary-card','rounds-card','job-status-panel','progress-panel'].forEach(id => toggle($(`#${id}`), false));
     $('#rounds-timeline').replaceChildren();
+    $('#navigation-leads').replaceChildren();
+    $('#navigation-details').open = false;
+    toggle($('#navigation-card'), false);
     $('#search-warnings').replaceChildren();
     $('#result-count').textContent = '0';
     $('#library-count').textContent = '0';
@@ -480,7 +484,8 @@
     if ($('#max-rounds').selectedOptions[0]?.disabled) $('#max-rounds').value = Array.from($('#max-rounds').options).find(option => !option.disabled)?.value || '3';
     $('#adaptive-search').disabled = !useAI;
     $('#max-rounds').disabled = !adaptive && !resumableStates.has(state.job?.state);
-    $('#adaptive-hint').textContent = !useAI ? '开启 AI 理解后可使用 AI 递进搜索' : !adaptive ? '本次使用一轮检索' : $('#max-rounds').value === '0' ? '持续探索；可随时停止，无新线索或服务不可用时也会暂停' : '依据结果调整关键词与平台，达到轮数后等你继续';
+    const agentic = backend.features.includes('agentic_search');
+    $('#adaptive-hint').textContent = !useAI ? '开启 AI 理解后可使用 AI 递进搜索' : !adaptive ? '本次使用一轮检索' : agentic ? `AI 决定搜索工具与执行顺序${$('#max-rounds').value === '0' ? '，可随时停止' : '，达到轮数后等你继续'}` : $('#max-rounds').value === '0' ? '持续探索；可随时停止，无新线索或服务不可用时也会暂停' : '依据实际线索调整下一步，达到轮数后等你继续';
     if (publicLimit > 0) $('#adaptive-hint').textContent += ` · 公开服务每段最多 ${publicLimit} 轮`;
     $('#report-mode-hint').textContent = useAI ? '开启 AI 理解后，每轮会额外生成一份进展报告。' : '已关闭 AI 理解，本次不生成每轮 AI 报告。';
   }
@@ -646,11 +651,12 @@
 
   function clearTaskView() {
     state.job = null; state.activeJobId = ''; state.stopRequested = false;
-    state.filter = 'all'; state.views = 'all'; state.lastResults = ''; state.lastAISummary = ''; state.lastRounds = '';
+    state.filter = 'all'; state.views = 'all'; state.lastResults = ''; state.lastAISummary = ''; state.lastRounds = ''; state.lastNavigation = '';
     state.summaryPending = false; state.summaryError = ''; resetProgressReport();
     $('#views-filter').value = 'all';
     $$('[data-filter]').forEach(button => { button.classList.toggle('active', button.dataset.filter === 'all'); button.setAttribute('aria-pressed', String(button.dataset.filter === 'all')); });
-    ['export-results','result-tools','answer-summary','ai-summary-card','native-links-section','engine-links-section','rounds-card','job-status-panel','progress-panel'].forEach(id => toggle($(`#${id}`), false));
+    ['export-results','result-tools','answer-summary','ai-summary-card','native-links-section','engine-links-section','rounds-card','navigation-card','job-status-panel','progress-panel'].forEach(id => toggle($(`#${id}`), false));
+    $('#navigation-leads').replaceChildren(); $('#navigation-details').open = false;
     $('#rounds-timeline').replaceChildren(); $('#search-warnings').replaceChildren(); $('#result-count').textContent = '0';
     $('#results').replaceChildren(empty('为新问题寻找线索', '其他任务会继续运行，可通过上方任务列表随时切换。'));
     $('#search-plan').replaceChildren(node('p', 'plan-intent', '新任务会独立拆解问题、检索并核对证据。'));
@@ -795,6 +801,7 @@
     renderNativeLinks(job.native_links);
     renderAISummary(job);
     renderProgressReport(job);
+    renderNavigation(job);
     renderRounds(job);
     renderJobControls();
     $('#answer-summary').textContent = job.summary || '';
@@ -869,8 +876,10 @@
     $('#round-count').textContent = `${Number(job.round) || rounds.length} 轮`;
     const latest = rounds[rounds.length - 1];
     const platforms = [...new Set((latest.queries || []).map(query => typeof query === 'object' ? query.platform : '').filter(Boolean))];
-    $('#round-focus').textContent = platforms.length ? `最近一轮涉及：${platforms.map(platform => platformNames[platform] || platform).join('、')}` : Number.isFinite(job.searches_count) ? `累计执行 ${job.searches_count} 次检索` : '依据各轮结果调整搜索方向';
-    const key = JSON.stringify(rounds);
+    const actions = (latest.queries || []).filter(query => query && typeof query === 'object' && query.action);
+    $('#round-focus').textContent = actions.length ? `最近一轮：${actions.slice(0, 6).map(action => actionNames[action.action] || action.action).join(' → ')}${actions.length > 6 ? ` · 共 ${actions.length} 个动作` : ''}` : platforms.length ? `最近一轮涉及：${platforms.map(platform => platformNames[platform] || platform).join('、')}` : Number.isFinite(job.searches_count) ? `累计执行 ${job.searches_count} 次检索` : '依据各轮结果调整搜索方向';
+    const leads = Array.isArray(job.navigation_leads) ? job.navigation_leads.filter(lead => lead && typeof lead === 'object') : [];
+    const key = JSON.stringify([rounds, leads.map(lead => [lead.id, lead.title, lead.url])]);
     if (key === state.lastRounds) return;
     state.lastRounds = key;
     const timeline = $('#rounds-timeline');
@@ -890,7 +899,10 @@
       if (Number.isFinite(round.total_results)) counts.push(`累计 ${round.total_results}`);
       heading.append(node('span', '', counts.join(' · ') || (round.phase ? stageNames[round.phase] || round.phase : '检索中')));
       item.append(heading);
+      if (round.planner) item.append(node('span', `round-planner ${round.planner === 'ai_actions' ? 'agentic' : 'fallback'}`, round.planner === 'ai_actions' ? 'AI 决定工具与顺序' : round.planner === 'fallback' ? '备用检索 · 非 AI 动作规划' : round.planner === 'mixed' ? 'AI 动作与备用路径' : String(round.planner)));
       if (round.reason) item.append(node('p', 'round-reason', round.reason));
+      const rationale = typeof round.ai_rationale === 'string' ? round.ai_rationale : Array.isArray(round.ai_rationale) ? round.ai_rationale.filter(value => typeof value === 'string').join('\n') : '';
+      if (rationale) { const decision = node('div', 'round-decision'); decision.append(node('strong', '', 'AI 决定依据'), node('p', '', rationale)); item.append(decision); }
       if (round.report && typeof round.report === 'object') {
         const report = node('details', 'round-progress-report');
         report.dataset.round = String(number);
@@ -902,7 +914,8 @@
       }
       if (Array.isArray(round.queries) && round.queries.length) {
         const queries = node('ul', 'round-queries');
-        round.queries.forEach(query => {
+        round.queries.forEach((query, index) => {
+          if (query && typeof query === 'object' && query.action) { queries.append(actionRow(query, index, job)); return; }
           const row = node('li');
           row.append(node('span', '', typeof query === 'string' ? query : query.query || ''));
           if (typeof query === 'object') row.append(node('small', '', [platformNames[query.platform] || query.platform, engineNames[query.provider] || query.provider].filter(Boolean).join(' · ')));
@@ -922,6 +935,78 @@
         item.append(feedback);
       }
       timeline.append(item);
+    });
+  }
+
+  function actionRow(action, index, job) {
+    const row = node('li', 'agent-action');
+    row.dataset.action = String(action.action);
+    if (action.id) row.dataset.actionId = String(action.id);
+    const status = String(action.status || 'queued');
+    row.dataset.status = status;
+    const labels = { queued:'等待执行', pending:'等待执行', running:'执行中', completed:'已完成', done:'已完成', success:'已完成', error:'未完成', failed:'未完成', skipped:'已跳过', cancelled:'已取消', canceled:'已取消', stopped:'已停止', blocked:'访问受限' };
+    const top = node('div', 'action-heading');
+    top.append(node('strong', '', `${index + 1}. ${actionNames[action.action] || action.action}`), node('span', 'action-state', action.ok === false && status === 'completed' ? '未成功' : labels[status] || status));
+    row.append(top);
+    if (action.query) row.append(node('p', 'action-query', action.query));
+    if (action.purpose) row.append(node('p', 'action-purpose', `目的：${action.purpose}`));
+    if (action.planner) row.append(node('small', 'action-planner', action.planner === 'ai_actions' ? '由 AI 选择' : '程序备用路径'));
+    const lead = Array.isArray(job.navigation_leads) ? job.navigation_leads.find(item => item && item.id === action.lead_id) : null;
+    const targetURL = action.target_url || lead?.url;
+    if (targetURL && safeURL(targetURL)) row.append(sourceLink(`目标：${lead?.title || action.domain || targetURL} ↗`, targetURL, 'action-target'));
+    else if (action.lead_id) row.append(node('p', 'action-target', `目标入口：${lead?.title || action.lead_id}`));
+    if (action.domain) row.append(node('small', '', `限定网站：${action.domain}`));
+    const source = [platformNames[action.platform] || action.platform, engineNames[action.provider] || action.provider].filter(Boolean).join(' · ');
+    if (source) row.append(node('small', 'action-source', source));
+    const dependencies = Array.isArray(action.depends_on) ? action.depends_on.filter(value => ['string','number'].includes(typeof value)).join('、') : typeof action.depends_on === 'string' ? action.depends_on : '';
+    if (dependencies) row.append(node('small', 'action-dependency', `依赖动作：${dependencies}`));
+    const counts = [];
+    if (Number.isFinite(action.discovered_count)) counts.push(`${action.discovered_count} 个导航入口`);
+    if (Number.isFinite(action.result_count)) counts.push(`${action.result_count} 条候选`);
+    if (counts.length) row.append(node('p', 'action-counts', counts.join(' · ')));
+    if (action.error) row.append(node('p', 'action-error', action.error));
+    if (action.coverage) row.append(node('p', 'action-coverage', action.coverage));
+    return row;
+  }
+
+  function renderNavigation(job) {
+    const leads = Array.isArray(job.navigation_leads) ? job.navigation_leads.filter(lead => lead && typeof lead === 'object') : [];
+    toggle($('#navigation-card'), leads.length > 0);
+    if (!leads.length) return;
+    $('#navigation-count').textContent = `${leads.length} 个入口`;
+    const key = JSON.stringify([job.id, leads]);
+    if (key === state.lastNavigation) return;
+    state.lastNavigation = key;
+    const container = $('#navigation-leads');
+    const expanded = new Set($$('details[open]', container).map(item => item.dataset.leadId));
+    container.replaceChildren();
+    const kinds = { website:'网站入口', channel:'账号 / 频道', video:'视频入口', page:'网页入口' };
+    leads.forEach(lead => {
+      const item = node('article', 'navigation-lead');
+      item.dataset.leadId = String(lead.id || '');
+      const top = node('div', 'navigation-lead-heading');
+      top.append(node('span', '', kinds[lead.kind] || '导航入口'), node('span', 'navigation-unverified', '尚未核验'));
+      const heading = node('h4');
+      heading.append(sourceLink(lead.title || lead.url || '未命名入口', lead.url));
+      item.append(top, heading);
+      if (lead.snippet) item.append(node('p', 'navigation-snippet', lead.snippet));
+      if (lead.purpose) item.append(node('p', 'navigation-purpose', `下一步用途：${lead.purpose}`));
+      const meta = [lead.error ? '读取遇到限制' : lead.inspected ? '已读取入口' : '尚未读取', platformNames[lead.platform] || lead.platform, Number.isFinite(lead.round) ? `第 ${lead.round} 轮发现` : '', lead.from_action ? `来自动作 ${lead.from_action}` : ''].filter(Boolean);
+      item.append(node('p', 'navigation-meta', meta.join(' · ')));
+      if (lead.error) item.append(node('p', 'action-error', lead.error));
+      if (lead.coverage) item.append(node('p', 'navigation-coverage', lead.coverage));
+      const links = Array.isArray(lead.links) ? lead.links.filter(link => link && typeof link === 'object' && safeURL(link.url)) : [];
+      if (links.length) {
+        const details = node('details', 'navigation-child-links');
+        details.dataset.leadId = String(lead.id || ''); details.open = expanded.has(details.dataset.leadId);
+        details.append(node('summary', '', `入口中发现的链接 · ${links.length}`));
+        const list = node('ul');
+        links.slice(0, 12).forEach(link => { const row = node('li'); row.append(sourceLink(link.title || link.url, link.url)); list.append(row); });
+        details.append(list);
+        if (links.length > 12) details.append(node('p', 'subtle', '此处展示前 12 个入口，完整记录保存在导出的 JSON 中。'));
+        item.append(details);
+      }
+      container.append(item);
     });
   }
 

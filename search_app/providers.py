@@ -1571,11 +1571,44 @@ def search_custom_site(site: dict, query: str, limit: int, config: dict) -> dict
     return {"results": [], "status": status}
 
 
-def _check_robots(url: str, cancel_event=None):
+def _page_domains(allowed_domains):
+    """Normalize an explicit scope without widening a discovered hostname."""
+    if allowed_domains is None:
+        return None
+    if not isinstance(allowed_domains, (list, tuple)):
+        raise PublicFetchError("页面域名范围必须是域名列表")
+    domains = []
+    for domain in allowed_domains:
+        if not isinstance(domain, str) or any(char in domain for char in "/:?#@"):
+            raise PublicFetchError("页面域名范围包含无效域名")
+        normalized = canonical_url("https://" + domain)
+        if not normalized:
+            raise PublicFetchError("页面域名范围包含无效域名")
+        domains.append(urllib.parse.urlsplit(normalized).hostname)
+    return tuple(dict.fromkeys(domains))
+
+
+def _require_page_scope(url, allowed_domains):
+    normalized = canonical_url(url)
+    if not normalized:
+        raise PublicFetchError("URL 无效或不是允许的公网 HTTP(S) 地址")
+    host = urllib.parse.urlsplit(normalized).hostname or ""
+    if allowed_domains is not None and not any(_host_matches(host, domain) for domain in allowed_domains):
+        raise PublicFetchError("页面地址超出所选域名范围，已在请求前停止")
+    return normalized
+
+
+def _check_robots(url: str, cancel_event=None, allowed_domains=None):
     parts = urllib.parse.urlsplit(url)
     robots_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, "/robots.txt", "", ""))
     try:
-        payload, headers, _, status = _request(robots_url, max_bytes=512_000, allowed_status=(404, 410), cancel_event=cancel_event)
+        def guard(target):
+            _check_cancel_event(cancel_event)
+            _require_page_scope(target, allowed_domains)
+
+        guard(robots_url)
+        payload, headers, final_url, status = _request(robots_url, max_bytes=512_000, allowed_status=(404, 410), redirect_guard=guard, cancel_event=cancel_event)
+        guard(final_url)
     except SearchCancelled:
         raise
     except PublicFetchError:
@@ -1687,43 +1720,193 @@ def _bilibili_video_text(document, url):
         text = "当前视频标题：" + title
         if description.strip():
             text += "\n当前视频简介：" + _clean(description, 30000)
-        return {"title": title, "text": text, "coverage": "仅当前视频标题和简介；未读取字幕、评论或推荐视频"}
-    return {"title": "", "text": "", "error": "未取得与当前视频匹配的公开简介；已忽略推荐列表，保留搜索摘要"}
+        links = []
+        owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+        mid = str(owner.get("mid", ""))
+        if re.fullmatch(r"[1-9][0-9]{0,19}", mid):
+            # The route is derived only from the matching video's actual owner
+            # metadata. It is a navigation lead, never evidence about an answer.
+            links.append({"url": "https://space.bilibili.com/" + mid,
+                          "title": (_clean(owner.get("name", ""), 450) or "当前视频作者") + "的频道（导航）",
+                          "platform": "bilibili", "kind": "channel"})
+        return {"title": title, "text": text, "links": links, "coverage": "仅当前视频标题和简介；未读取字幕、评论或推荐视频"}
+    return {"title": "", "text": "", "links": [], "error": "未取得与当前视频匹配的公开简介；已忽略推荐列表，保留搜索摘要"}
 
 
-def fetch_public_page(url: str, max_chars=12000, cancel_event=None) -> dict:
+def _public_link_kind(url):
+    """Classify definite public video routes, without inventing target URLs."""
+    parts = urllib.parse.urlsplit(url)
+    host, path = parts.hostname or "", parts.path
+    if _host_matches(host, "bilibili.com"):
+        if re.fullmatch(r"/video/(?:BV[A-Za-z0-9]+|av[0-9]+)/?", path, re.I) or re.fullmatch(r"/bangumi/play/(?:ep|ss)[0-9]+/?", path):
+            return "video"
+        if host == "space.bilibili.com" and re.match(r"/[1-9][0-9]*(?:/|$)", path):
+            return "channel"
+    if (_host_matches(host, "douyin.com") or _host_matches(host, "iesdouyin.com")) and re.fullmatch(r"/(?:share/)?video/[0-9]+/?", path):
+        return "video"
+    if _host_matches(host, "youtube.com") or _host_matches(host, "youtube-nocookie.com"):
+        video_id = urllib.parse.parse_qs(parts.query).get("v", [""])[0]
+        if path == "/watch" and re.fullmatch(r"[A-Za-z0-9_-]{6,64}", video_id) or re.fullmatch(r"/(?:shorts|live|embed)/[A-Za-z0-9_-]{6,64}/?", path):
+            return "video"
+        if re.match(r"/(?:channel/|user/|c/|@)[^/]+", path):
+            return "channel"
+    if host in ("youtu.be", "www.youtu.be") and re.fullmatch(r"/[A-Za-z0-9_-]{6,64}/?", path):
+        return "video"
+    if _host_matches(host, "vimeo.com") and re.fullmatch(r"/(?:video/)?[0-9]+/?", path):
+        return "video"
+    if re.search(r"\.(?:mp4|webm|ogv|mov)$", path, re.I):
+        return "video"
+    return "page"
+
+
+def _page_node_excluded(node):
+    # Visible site navigation is useful for exploration. Search-result parsing
+    # excludes nav/footer, whereas actual page links may legitimately use them.
+    if node.tag in ("script", "style", "form", "template", "noscript", "svg", "canvas"):
+        return True
+    if node.tag in ("nav", "footer"):
+        return "hidden" in node.attrs or str(node.attrs.get("aria-hidden", "")).strip().lower() == "true" or bool(re.search(r"(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|content-visibility\s*:\s*hidden)", re.sub(r"/\*.*?\*/", "", str(node.attrs.get("style", "")), flags=re.S), re.I))
+    return _search_node_excluded(node)
+
+
+def _page_hidden(node):
+    while node is not None:
+        if _page_node_excluded(node):
+            return True
+        node = node.parent
+    return False
+
+
+def _page_login_or_challenge(parser, url):
+    if _search_challenge(parser, url):
+        return True
+    for node in _search_nodes(parser.root):
+        if node.tag == "title":
+            title = _search_text(node, 500).lower()
+            if any(term in title for term in ("captcha", "just a moment", "人机验证", "安全验证", "访问验证", "登录 - ")) or re.match(r"^(?:登录|登入|sign in|log in)(?:\s|[-|—]|$)", title):
+                return True
+        if node.tag == "input" and str(node.attrs.get("type", "")).lower() == "password":
+            # A visible credential form is not a public evidence page. Hidden
+            # login overlays/templates alone do not invalidate a public article.
+            ancestor = node
+            concealed = False
+            while ancestor is not None:
+                if ancestor.tag in ("script", "style", "template", "noscript") or "hidden" in ancestor.attrs or str(ancestor.attrs.get("aria-hidden", "")).lower() == "true" or re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", ancestor.attrs.get("style", ""), re.I):
+                    concealed = True
+                    break
+                ancestor = ancestor.parent
+            if not concealed:
+                return True
+    return False
+
+
+def _page_links(parser, base_url, allowed_domains=None):
+    links, seen = [], {canonical_url(base_url)}
+    for node in _search_nodes(parser.root):
+        if node.tag == "base" and "href" in node.attrs and not _page_hidden(node):
+            declared = canonical_url(urllib.parse.urljoin(base_url, node.attrs.get("href") or ""))
+            if declared:
+                base_url = declared
+            break
+    for node in _search_nodes(parser.root):
+        if node.tag not in ("a", "video", "source", "iframe") or _page_hidden(node):
+            continue
+        raw = node.attrs.get("href" if node.tag == "a" else "src", "")
+        if not isinstance(raw, str) or not raw.strip() or raw.strip().startswith("#") or "download" in node.attrs:
+            continue
+        url = canonical_url(urllib.parse.urljoin(base_url, raw.strip()))
+        if not url or url in seen:
+            continue
+        host, path = urllib.parse.urlsplit(url).hostname or "", urllib.parse.urlsplit(url).path
+        if allowed_domains is not None and not any(_host_matches(host, domain) for domain in allowed_domains):
+            continue
+        if re.search(r"/(?:login|signin|signup|register|logout|captcha|antispider|showcaptcha)(?:/|$)", path, re.I):
+            continue
+        kind = _public_link_kind(url)
+        if node.tag != "a" and kind != "video":
+            continue
+        title = _search_text(node, 500) or str(node.attrs.get("title") or node.attrs.get("aria-label") or "").strip()[:500]
+        if not title:
+            for child in _search_nodes(node):
+                if child.tag == "img" and not _page_hidden(child) and child.attrs.get("alt"):
+                    title = str(child.attrs["alt"]).strip()[:500]
+                    break
+        if not title and kind == "video":
+            title = "页面中的视频链接"
+        if not title:
+            continue
+        seen.add(url)
+        links.append({"url": url, "title": title, "platform": platform_of(url), "kind": kind})
+        if len(links) >= 40:
+            break
+    return links
+
+
+def _page_visible_text(parser, limit):
+    pieces, length = [], 0
+    pending = [parser.root]
+    while pending and length < limit:
+        node = pending.pop()
+        if isinstance(node, str):
+            pieces.append(node[:limit - length])
+            length += len(pieces[-1])
+        elif node.tag not in ("head", "title", "svg", "canvas", "iframe") and not _search_node_excluded(node):
+            if node.tag in _PlainText.BLOCKS:
+                pieces.append("\n")
+                pending.append("\n")
+            pending.extend(reversed(node.children))
+    return "\n".join(line for line in (re.sub(r"\s+", " ", value).strip() for value in "".join(pieces).splitlines()) if line)
+
+
+def fetch_public_page(url: str, max_chars=12000, cancel_event=None, allowed_domains=None) -> dict:
     canonical = canonical_url(url)
-    result = {"url": canonical, "title": "", "text": ""}
+    result = {"url": canonical, "title": "", "text": "", "links": []}
     try:
         _check_cancel_event(cancel_event)
-        if not canonical:
-            raise PublicFetchError("URL 无效或不是允许的公网 HTTP(S) 地址")
-        _check_robots(canonical, cancel_event=cancel_event)
+        allowed_domains = _page_domains(allowed_domains)
+
+        def guard(target):
+            _check_cancel_event(cancel_event)
+            _require_page_scope(target, allowed_domains)
+            _check_robots(target, cancel_event=cancel_event, allowed_domains=allowed_domains)
+
+        guard(canonical)
         payload, headers, final_url, _ = _request(canonical, headers={"Accept": "text/html,text/plain;q=0.9"},
-                                                redirect_guard=lambda target: _check_robots(target, cancel_event=cancel_event), cancel_event=cancel_event)
+                                                redirect_guard=guard, cancel_event=cancel_event)
         _check_cancel_event(cancel_event)
+        _require_page_scope(final_url, allowed_domains)
         result["url"] = final_url
         content_type = next((str(v).lower() for k, v in headers.items() if k.lower() == "content-type"), "")
         if not any(kind in content_type for kind in ("text/html", "application/xhtml+xml", "text/plain")):
             raise PublicFetchError("来源不是可提取正文的 HTML 或文本页面")
         document = _decode(payload, headers)
         max_chars = max(200, min(int(max_chars), 50000))
+        tree = None
+        if "text/plain" not in content_type:
+            tree = _SearchHTML()
+            tree.feed(document)
+            if _page_login_or_challenge(tree, final_url):
+                raise PublicFetchError("来源显示登录或人机验证页面，未绕过")
         video = _bilibili_video_text(document, final_url)
         if video is not None:
             result.update(video)
             result["text"] = result["text"][:max_chars]
+            result["links"] = [link for link in result["links"] if allowed_domains is None or any(_host_matches(urllib.parse.urlsplit(link["url"]).hostname or "", domain) for domain in allowed_domains)]
+            _check_cancel_event(cancel_event)
             return result
         parser = _PlainText()
         parser.feed(document)
         title = re.sub(r"\s+", " ", "".join(parser.title_parts)).strip()
-        text = parser.text() if "text/plain" not in content_type else document
+        text = _page_visible_text(tree, MAX_BYTES) if tree is not None else document
         if any(term in title.lower() for term in ("captcha", "just a moment", "人机验证", "安全验证", "访问验证", "登录 - ")):
             raise PublicFetchError("来源显示登录或人机验证页面，未绕过")
-        result.update(title=title[:500], text=text[:max_chars])
+        links = _page_links(tree, final_url, allowed_domains) if tree is not None else []
+        _check_cancel_event(cancel_event)
+        result.update(title=title[:500], text=text[:max_chars], links=links)
         if len(text.strip()) < 60:
             result["error"] = "页面正文不足，可能依赖 JavaScript、登录或访问权限；保留搜索摘要"
     except SearchCancelled as exc:
-        result.update(cancelled=True, error=str(exc))
+        result.update(cancelled=True, error=str(exc), title="", text="", links=[])
     except PublicFetchError as exc:
         result["error"] = str(exc)
     except Exception:

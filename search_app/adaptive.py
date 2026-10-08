@@ -132,6 +132,9 @@ def run_adaptive_search(job, config, storage, update, stop_event):
 
     query = job['query']
     public_post_only = bool(job.get('public_post_only') or check_query(query).get('public_post_only'))
+    if job.get('use_ai', True) and config.get('api_key') and not public_post_only:
+        from .agentic import run_agentic_search
+        return run_agentic_search(job, config, storage, update, stop_event)
     use_ai = bool(job.get('use_ai', True))
     profile = depth_profile(job.get('depth'))
     concurrency = effective_search_concurrency(job, config)

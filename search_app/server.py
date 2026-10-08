@@ -614,7 +614,7 @@ class Handler(BaseHTTPRequestHandler):
             public_limits = capabilities.get('public_limits', {})
             search_limits = {'max_active_jobs': public_limits.get('max_session_jobs', self.app.max_active_jobs),
                              'max_search_concurrency': public_limits.get('search_concurrency', self.app.max_search_concurrency)}
-            return self.respond(200, {'ok': True, 'version': '1.4.0', 'features': ['ai_summary', 'adaptive_search', 'stop_resume', 'custom_sites', 'round_progress_reports', 'direct_longtail_sources', 'research_depth', 'multi_engine_search', 'concurrent_search'],
+            return self.respond(200, {'ok': True, 'version': '1.4.0', 'features': ['ai_summary', 'adaptive_search', 'stop_resume', 'custom_sites', 'round_progress_reports', 'direct_longtail_sources', 'research_depth', 'multi_engine_search', 'concurrent_search', 'agentic_search'],
                                      'search_limits': search_limits, **capabilities})
         if path == '/api/session' and self.public_sessions:
             if self._visitor is None:
