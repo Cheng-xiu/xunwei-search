@@ -179,9 +179,14 @@ class TransportPolicy:
         origins = headers.get_all('Origin', [])
         if origins and (len(origins) != 1 or self.cors_origin(headers, port) is None):
             return 403, '拒绝未授权来源的跨站请求。'
-        if headers.get('Sec-Fetch-Site') == 'cross-site' and (not self.remote or not origins):
-            return 403, '拒绝跨站请求。'
         is_api = path == '/api' or path.startswith('/api/')
+        # A link from another page is a normal top-level document navigation.
+        # Only static reads get this exception; Host/Origin were checked above.
+        document_navigation = (method in ('GET', 'HEAD') and not is_api
+                               and headers.get('Sec-Fetch-Mode') == 'navigate'
+                               and headers.get('Sec-Fetch-Dest') == 'document')
+        if headers.get('Sec-Fetch-Site') == 'cross-site' and (not self.remote or not origins) and not document_navigation:
+            return 403, '拒绝跨站请求。'
         exempt = method == 'OPTIONS' or (method == 'GET' and path == '/api/health')
         if self.remote and is_api and not exempt and not defer_auth:
             if not self.is_admin(headers):
